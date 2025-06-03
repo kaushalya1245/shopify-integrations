@@ -181,7 +181,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     ],
   };
 
-  if (rawPhone.includes("9309950513")) {
+  if (rawPhone.includes("7073968463")) {
     const response = await axios.post(
       "https://backend.aisensy.com/campaign/t1/api/v2",
       payload
@@ -311,7 +311,7 @@ async function sendOrderConfirmation(order) {
       ],
     };
 
-    if (rawPhone.includes("9309950513")) {
+    if (rawPhone.includes("7073968463")) {
       const response = await axios.post(
         "https://backend.aisensy.com/campaign/t1/api/v2",
         payload
@@ -414,7 +414,7 @@ async function sendFulfillmentMessage(fulfillment) {
     };
 
     console.log(rawPhone);
-    if (rawPhone.includes("9309950513")) {
+    if (rawPhone.includes("7073968463")) {
       const response = await axios.post(
         "https://backend.aisensy.com/campaign/t1/api/v2",
         payload
