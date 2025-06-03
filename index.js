@@ -361,6 +361,7 @@ async function sendFulfillmentMessage(fulfillment) {
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
     const fulfillmentStatusURL = fulfillment.tracking_url;
+    console.log(`Fulfillment status URL: ${fulfillmentStatusURL}`);
 
     // Product image
     let imageUrl = "https://default-product-image.jpg";
@@ -383,6 +384,8 @@ async function sendFulfillmentMessage(fulfillment) {
         console.error("Failed to fetch product image:", imageError);
       }
     }
+
+    console.log(fulfillmentStatusURL);
 
     const payload = {
       apiKey: process.env.AISENSY_API_KEY,
