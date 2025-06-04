@@ -66,8 +66,8 @@ function saveSet(filePath, set, item) {
 // --- Abandoned Checkouts ---
 // Message queue and suppression logic
 const recentUsers = new Map();
-const USER_SUPPRESSION_WINDOW = 10 * 60 * 1000; // 10 mins
-const SEND_MESSAGE_DELAY = 1 * 60 * 1000; // 1 min delay
+const USER_SUPPRESSION_WINDOW = 12 * 60 * 60 * 1000; // 10 mins
+const SEND_MESSAGE_DELAY = 10 * 60 * 1000; // 10 min delay
 let isSending = false;
 const messageQueue = [];
 
@@ -177,20 +177,16 @@ async function handleAbandonedCheckoutMessage(checkout) {
         sub_type: "url",
         index: "0",
         parameters: [{ type: "text", text: abandonedCheckoutUrl }],
-      }
+      },
     ],
   };
 
-  if (rawPhone.includes("7073968463")) {
-    const response = await axios.post(
-      "https://backend.aisensy.com/campaign/t1/api/v2",
-      payload
-    );
-    console.log("Abandoned checkout message sent:", response.data);
-    saveSet(dataFiles.tokens, processedTokens, checkout.token);
-  } else {
-    console.log("Skipping message for phone:", rawPhone);
-  }
+  const response = await axios.post(
+    "https://backend.aisensy.com/campaign/t1/api/v2",
+    payload
+  );
+  console.log("Abandoned checkout message sent:", response.data);
+  saveSet(dataFiles.tokens, processedTokens, checkout.token);
 }
 
 function isRecentlyMessaged(checkout) {
@@ -311,16 +307,12 @@ async function sendOrderConfirmation(order) {
       ],
     };
 
-    if (rawPhone.includes("7073968463")) {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      );
-      console.log("Order confirmation message sent:", response.data);
-      saveSet(dataFiles.orders, processedOrders, order.id.toString());
-    } else {
-      console.log("Skipping message for phone:", rawPhone);
-    }
+    const response = await axios.post(
+      "https://backend.aisensy.com/campaign/t1/api/v2",
+      payload
+    );
+    console.log("Order confirmation message sent:", response.data);
+    saveSet(dataFiles.orders, processedOrders, order.id.toString());
   } catch (err) {
     console.error("Order confirmation error:", err);
   }
@@ -392,7 +384,12 @@ async function sendFulfillmentMessage(fulfillment) {
       destination: cleanedPhone,
       userName: name,
       source: "fulfillment",
-      templateParams: [name, `${orderName}`, `${trackingNumber}`, fulfillmentStatusURL],
+      templateParams: [
+        name,
+        `${orderName}`,
+        `${trackingNumber}`,
+        fulfillmentStatusURL,
+      ],
       media: {
         url: imageUrl,
         filename: "product.jpg",
@@ -412,21 +409,16 @@ async function sendFulfillmentMessage(fulfillment) {
       ],
     };
 
-    console.log(rawPhone);
-    if (rawPhone.includes("7073968463")) {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      );
-      console.log("Fulfillment message sent:", response.data);
-      saveSet(
-        dataFiles.fulfillments,
-        processedFulfillments,
-        fulfillment.id.toString()
-      );
-    } else {
-      console.log("Skipping fulfillment message for phone:", rawPhone);
-    }
+    const response = await axios.post(
+      "https://backend.aisensy.com/campaign/t1/api/v2",
+      payload
+    );
+    console.log("Fulfillment message sent:", response.data);
+    saveSet(
+      dataFiles.fulfillments,
+      processedFulfillments,
+      fulfillment.id.toString()
+    );
   } catch (err) {
     console.error("Fulfillment message error:", err);
   }
