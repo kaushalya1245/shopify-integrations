@@ -177,7 +177,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
         sub_type: "url",
         index: "0",
         parameters: [{ type: "text", text: abandonedCheckoutUrl }],
-      },
+      }
     ],
   };
 
@@ -253,7 +253,7 @@ async function sendOrderConfirmation(order) {
     const shippingAddress = order.shipping_address || {};
     const name =
       shippingAddress.first_name || customer.first_name || "Customer";
-    const confirmationNumber = order.confirmation_number || "Unknown Order";
+    const orderName = order.name.replace("#", "") || "Unknown Order";
     const amount = order.total_price || "0";
 
     let rawPhone = shippingAddress.phone || customer.phone || "";
@@ -296,7 +296,7 @@ async function sendOrderConfirmation(order) {
       destination: cleanedPhone,
       userName: name,
       source: "organic",
-      templateParams: [name, confirmationNumber, `₹${amount}`, orderStatusURL],
+      templateParams: [name, orderName, `₹${amount}`, orderStatusURL],
       media: {
         url: imageUrl,
         filename: "order.jpg",
@@ -346,6 +346,8 @@ async function sendFulfillmentMessage(fulfillment) {
     const orderId = fulfillment.order_id;
     const customer = fulfillment.destination || {};
     const name = customer.first_name || "Customer";
+    const orderName =
+      fulfillment.name.replace("#", "").split(".")[0] || "Unknown Order";
     const trackingNumber = fulfillment.tracking_number || "Unknown fulfillment";
     let amount = "0";
     try {
@@ -361,7 +363,6 @@ async function sendFulfillmentMessage(fulfillment) {
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
     const fulfillmentStatusURL = fulfillment.tracking_url;
-    console.log(`Fulfillment status URL: ${fulfillmentStatusURL}`);
 
     // Product image
     let imageUrl = "https://default-product-image.jpg";
@@ -385,15 +386,13 @@ async function sendFulfillmentMessage(fulfillment) {
       }
     }
 
-    console.log(fulfillmentStatusURL);
-
     const payload = {
       apiKey: process.env.AISENSY_API_KEY,
       campaignName: process.env.OST_CAMPAIGN_NAME,
       destination: cleanedPhone,
       userName: name,
       source: "fulfillment",
-      templateParams: [name, `${orderId}`, `${trackingNumber}`],
+      templateParams: [name, `${orderName}`, `${trackingNumber}`, fulfillmentStatusURL],
       media: {
         url: imageUrl,
         filename: "product.jpg",
