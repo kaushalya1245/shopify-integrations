@@ -1,5 +1,7 @@
 // shopify-webhooks-all-in-one.js
+require("dotenv").config();
 const express = require("express");
+const crypto = require("crypto");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -9,23 +11,29 @@ const {
   Session,
 } = require("@shopify/shopify-api");
 const { nodeAdapter } = require("@shopify/shopify-api/adapters/node");
-require("dotenv").config();
+const { razorpayClient } = require("./razorpayClient");
 
 const app = express();
-app.use(express.json());
-
 // Logging middleware
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
+
 // Shopify setup (shared)
 const shopify = shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
   apiSecretKey: process.env.SHOPIFY_API_SECRET,
   adminApiAccessToken: process.env.SHOPIFY_ADMIN_TOKEN,
-  scopes: ["read_orders", "write_orders", "read_checkouts"],
+  scopes: ["read_orders", "write_orders", "read_checkouts", "read_customers"],
   shop: process.env.SHOPIFY_DOMAIN,
   apiVersion: LATEST_API_VERSION,
   isCustomStoreApp: true,
@@ -66,8 +74,8 @@ function saveSet(filePath, set, item) {
 // --- Abandoned Checkouts ---
 // Message queue and suppression logic
 const recentUsers = new Map();
-const USER_SUPPRESSION_WINDOW = 12 * 60 * 60 * 1000; // 10 mins
-const SEND_MESSAGE_DELAY = 10 * 60 * 1000; // 10 min delay
+const USER_SUPPRESSION_WINDOW = 12 * 60 * 60 * 1000; // 12 Hours
+const SEND_MESSAGE_DELAY = 15 * 60 * 1000; // 15 Minutes delay
 let isSending = false;
 const messageQueue = [];
 
@@ -110,17 +118,16 @@ async function handleAbandonedCheckoutMessage(checkout) {
       },
     });
     orders = res.body.orders;
+    const isOrderNotAbandoned = orders.find(
+      (o) => o.cart_token === checkout.cart_token
+    );
+    if (isOrderNotAbandoned) return;
+
+    const isConverted = orders.find((o) => o.checkout_token === checkout.token);
+    if (isConverted) return;
   } catch (err) {
     console.error("Failed to fetch orders:", err);
   }
-
-  const isOrderNotAbandoned = orders.find(
-    (o) => o.cart_token === checkout.cart_token
-  );
-  if (isOrderNotAbandoned) return;
-
-  const isConverted = orders.find((o) => o.checkout_token === checkout.token);
-  if (isConverted) return;
 
   const name = checkout.shipping_address?.first_name || "Customer";
   const amount = checkout.total_price || "0";
@@ -133,17 +140,17 @@ async function handleAbandonedCheckoutMessage(checkout) {
     headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
   };
 
-  let imageUrl = "https://your-default.jpg";
+  let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
 
   try {
     const variantRes = await axios.get(
-      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2023-07/variants/${variantId}.json`,
+      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
       headers
     );
     const imageId = variantRes.data.variant.image_id;
 
     const productImagesRes = await axios.get(
-      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2023-07/products/${productId}/images.json`,
+      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
       headers
     );
     const allImages = productImagesRes.data?.images || [];
@@ -181,12 +188,24 @@ async function handleAbandonedCheckoutMessage(checkout) {
     ],
   };
 
-  const response = await axios.post(
-    "https://backend.aisensy.com/campaign/t1/api/v2",
-    payload
-  );
-  console.log("Abandoned checkout message sent:", response.data);
-  saveSet(dataFiles.tokens, processedTokens, checkout.token);
+  try {
+    // Uncomment the following lines to send the message via AISensy
+    const response = await axios.post(
+      "https://backend.aisensy.com/campaign/t1/api/v2",
+      payload
+    );
+    saveSet(dataFiles.tokens, processedTokens, checkout.token);
+    console.log("Abandoned checkout message sent:", response.data);
+    console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
+  } catch (err) {
+    console.error("Abandoned checkout message error:", err);
+    if (err.response) {
+      console.error("Response data:", err.response.data);
+      console.error("Response status:", err.response.status);
+      console.error("Response headers:", err.response.headers);
+    }
+    throw err;
+  }
 }
 
 function isRecentlyMessaged(checkout) {
@@ -200,6 +219,187 @@ function isRecentlyMessaged(checkout) {
 
   recentUsers.set(key, now);
   return false;
+}
+
+async function createOrderFromPayment(checkout, payment, orderId) {
+  if (!checkout || !checkout.token) {
+    console.log("No checkout token provided. Skipping order creation.");
+    return;
+  }
+  if (!payment || !payment.id) {
+    console.log("No payment ID provided. Skipping order creation.");
+    return;
+  }
+
+  try {
+    await axios.delete(
+      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/orders/${orderId}.json`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    console.log(`✅ Deleted existing order with ID: ${orderId}`);
+  } catch (error) {
+    console.error("Error deleting existing order:", error);
+    if (error.response) {
+      console.error("Response data:", error.response.data);
+      console.error("Response status:", error.response.status);
+    }
+    return;
+  }
+
+  const orderPayload = {
+    order: {
+      email: checkout.email,
+      phone: checkout.phone || checkout.shipping_address?.phone,
+      currency: checkout.currency,
+      // source_name: "web",
+      customer: checkout.customer || undefined,
+      billing_address: checkout.billing_address,
+      shipping_address: checkout.shipping_address,
+
+      // line items
+      line_items: checkout.line_items.map((item) => ({
+        variant_id: item.variant_id,
+        quantity: item.quantity,
+      })),
+
+      // shipping lines (mirrors the store UI)
+      shipping_lines: [
+        {
+          title: checkout.shipping_line?.title || "Standard",
+          price: checkout.shipping_line?.price || "0.00",
+          code: checkout.shipping_line?.code || "Standard",
+          // source: "shopify",
+        },
+      ],
+
+      // tax lines (so Shopify shows IGST etc)
+      tax_lines: (checkout.tax_lines || []).map((t) => ({
+        price: t.price,
+        rate: t.rate,
+        title: t.title,
+      })),
+
+      // financials
+      financial_status: "paid",
+      transactions: [
+        {
+          kind: "sale",
+          status: "success",
+          amount: checkout.total_price,
+          gateway: "razorpay",
+          authorization: payment.id,
+        },
+      ],
+
+      // optional note/tag so you can skip it later
+      note: `Auto-created after Razorpay capture (${payment.id})`,
+      tags: "ManualOrder,RazorpayPaid",
+    },
+  };
+
+  // Step 3: Create the order
+  try {
+    const orderResponse = await client.post({
+      path: "orders",
+      data: orderPayload,
+      type: "application/json",
+    });
+
+    console.log(
+      "✅ Order created from abandoned checkout:",
+      orderResponse.body.order.id
+    );
+  } catch (error) {
+    console.error("❌ Error creating order from checkout:", error);
+    if (error.response) {
+      console.error("Response data:", error.response.data);
+      console.error("Response status:", error.response.status);
+    }
+  }
+}
+
+async function verifyOrder(checkout) {
+  if (!checkout || !checkout.token) {
+    console.log("No checkout token provided. Skipping payment fetch.");
+    return;
+  }
+  if (!razorpayClient) {
+    console.log("Razorpay client not initialized. Skipping payment fetch.");
+    return;
+  }
+
+  if (!checkout.token) return;
+
+  if (!checkout.email && !checkout.phone && !checkout.shipping_address?.phone) {
+    console.log("Skipping incomplete checkout (missing contact info)");
+    return;
+  }
+
+  let orders = [];
+  let orderId = null;
+  try {
+    const queryField = checkout.email ? "email" : "phone";
+    const queryValue = checkout.email || checkout.phone;
+    const res = await client.get({
+      path: "orders",
+      query: {
+        [queryField]: queryValue,
+        fields: "id, checkout_token, cart_token",
+        status: "any",
+        limit: 5,
+      },
+    });
+    orders = res.body.orders;
+
+    const isOrderNotAbandoned = orders.find(
+      (o) => o.cart_token === checkout.cart_token
+    );
+    if (isOrderNotAbandoned) {
+      orderId = isOrderNotAbandoned.id;
+      console.log(
+        `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
+      );
+      return;
+    } else {
+      console.log(
+        `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
+      );
+    }
+
+    const isConverted = orders.find((o) => o.checkout_token === checkout.token);
+    if (isConverted) {
+      console.log(
+        `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
+      );
+      return;
+    }
+  } catch (err) {
+    console.error("Failed to fetch orders:", err);
+  }
+
+  try {
+    const todaysPayments = await razorpayClient.fetchTodaysPayments();
+    if (!todaysPayments || !todaysPayments.items) {
+      console.log("No payments found for today.");
+      return;
+    }
+    console.log(`Found ${todaysPayments.items.length} payments for today.`);
+
+    todaysPayments.items.map((payment) => {
+      if (payment.status !== "captured") return;
+      if (payment.notes.cancelUrl.indexOf(checkout.cart_token) !== -1) {
+        createOrderFromPayment(checkout, payment, orderId);
+      }
+    });
+  } catch (error) {
+    console.error("Error fetching payments:", error);
+    throw error;
+  }
 }
 
 app.post("/webhook/abandoned-checkouts", async (req, res) => {
@@ -237,6 +437,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
   setTimeout(() => {
     messageQueue.push({ checkout });
     processQueue();
+    verifyOrder(checkout);
   }, SEND_MESSAGE_DELAY);
 });
 
@@ -256,22 +457,26 @@ async function sendOrderConfirmation(order) {
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
     // Fetch product image
-    let imageUrl = "https://default-product-image.jpg";
+    let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
     if (order.line_items?.length) {
       const productId = order.line_items[0].product_id;
       const variantId = order.line_items[0].variant_id;
+      const headers = {
+        headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+      };
 
       try {
-        const productRes = await client.get({
-          path: `products/${productId}/images`,
-        });
-        if (productRes.body.images?.length) {
-          const variantImage = productRes.body.images.find((img) =>
+        const productImagesRes = await axios.get(
+          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
+          headers
+        );
+        if (productImagesRes?.data?.images?.length) {
+          const variantImage = productImagesRes?.data?.images.find((img) =>
             img.variant_ids.includes(variantId)
           );
-          imageUrl = (variantImage || productRes.body.images[0]).src.split(
-            "?"
-          )[0];
+          imageUrl = (
+            variantImage || productImagesRes?.data?.images[0]
+          ).src.split("?")[0];
         }
       } catch (imageError) {
         console.error("Failed to fetch product image:", imageError);
@@ -307,19 +512,30 @@ async function sendOrderConfirmation(order) {
       ],
     };
 
-    const response = await axios.post(
-      "https://backend.aisensy.com/campaign/t1/api/v2",
-      payload
-    );
-    console.log("Order confirmation message sent:", response.data);
-    saveSet(dataFiles.orders, processedOrders, order.id.toString());
+    try {
+      const response = await axios.post(
+        "https://backend.aisensy.com/campaign/t1/api/v2",
+        payload
+      );
+      saveSet(dataFiles.orders, processedOrders, order.id.toString());
+      console.log("Order confirmation message sent:", response.data);
+      console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+    } catch (err) {
+      console.error("Order confirmation message error:", err);
+      if (err.response) {
+        console.error("Response data:", err.response.data);
+        console.error("Response status:", err.response.status);
+        console.error("Response headers:", err.response.headers);
+      }
+      throw err;
+    }
   } catch (err) {
     console.error("Order confirmation error:", err);
   }
 }
 
 app.post("/webhook/order-confirmation", (req, res) => {
-  res.status(200).send("OK");
+  res.status(200).send("Order confirmation webhook received");
   const order = req.body;
 
   if (processedOrders.has(order.id.toString())) {
@@ -341,7 +557,6 @@ async function sendFulfillmentMessage(fulfillment) {
     const orderName =
       fulfillment.name.replace("#", "").split(".")[0] || "Unknown Order";
     const trackingNumber = fulfillment.tracking_number || "Unknown fulfillment";
-    let amount = "0";
     try {
       const order = await client.get({
         path: `orders/${orderId}`,
@@ -349,6 +564,8 @@ async function sendFulfillmentMessage(fulfillment) {
       amount = order.body.order.total_price || "0";
     } catch (orderError) {
       console.error("Failed to fetch order details:", orderError);
+    } finally {
+      console.log(`Processing fulfillment for order ${orderName} (${orderId})`);
     }
 
     let rawPhone = customer.phone || "";
@@ -357,21 +574,26 @@ async function sendFulfillmentMessage(fulfillment) {
     const fulfillmentStatusURL = fulfillment.tracking_url;
 
     // Product image
-    let imageUrl = "https://default-product-image.jpg";
+    let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
     if (fulfillment.line_items?.length > 0) {
       const productId = fulfillment.line_items[0].product_id;
       const variantId = fulfillment.line_items[0].variant_id;
+      const headers = {
+        headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+      };
+
       try {
-        const productRes = await client.get({
-          path: `products/${productId}/images`,
-        });
-        if (productRes.body.images?.length > 0) {
-          const variantImage = productRes.body.images.find((img) =>
+        const productImagesRes = await axios.get(
+          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
+          headers
+        );
+        if (productImagesRes?.data?.images?.length > 0) {
+          const variantImage = productImagesRes?.data?.images.find((img) =>
             img.variant_ids.includes(variantId)
           );
-          imageUrl = (variantImage || productRes.body.images[0]).src.split(
-            "?"
-          )[0];
+          imageUrl = (
+            variantImage || productImagesRes?.data?.images[0]
+          ).src.split("?")[0];
         }
       } catch (imageError) {
         console.error("Failed to fetch product image:", imageError);
@@ -409,16 +631,27 @@ async function sendFulfillmentMessage(fulfillment) {
       ],
     };
 
-    const response = await axios.post(
-      "https://backend.aisensy.com/campaign/t1/api/v2",
-      payload
-    );
-    console.log("Fulfillment message sent:", response.data);
-    saveSet(
-      dataFiles.fulfillments,
-      processedFulfillments,
-      fulfillment.id.toString()
-    );
+    try {
+      const response = await axios.post(
+        "https://backend.aisensy.com/campaign/t1/api/v2",
+        payload
+      );
+      saveSet(
+        dataFiles.fulfillments,
+        processedFulfillments,
+        fulfillment.id.toString()
+      );
+      console.log("Fulfillment message sent:", response.data);
+      console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
+    } catch (err) {
+      console.error("Fulfillment message error:", err);
+      if (err.response) {
+        console.error("Response data:", err.response.data);
+        console.error("Response status:", err.response.status);
+        console.error("Response headers:", err.response.headers);
+      }
+      throw err;
+    }
   } catch (err) {
     console.error("Fulfillment message error:", err);
   }
