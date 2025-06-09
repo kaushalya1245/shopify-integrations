@@ -199,8 +199,8 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.log("Abandoned checkout message sent:", response.data);
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
-    console.log(`Abandoned checkout message not sent to (${cleanedPhone})`);
     console.error("Abandoned checkout message error");
+    console.log(`Abandoned checkout message cannot be sent to (${cleanedPhone})`);
     if (err.response) {
       console.error("Response data:", err.response.data);
       console.error("Response status:", err.response.status);
@@ -392,7 +392,6 @@ async function verifyOrder(checkout) {
     console.log(`Found ${todaysPayments.items.length} payments for today.`);
 
     todaysPayments.items.map((payment) => {
-      console.log(payment);
       if (payment.status !== "captured") return;
       if (payment?.notes?.cancelUrl === undefined) return;
       if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
@@ -525,7 +524,8 @@ async function sendOrderConfirmation(order) {
       console.log("Order confirmation message sent:", response.data);
       console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
     } catch (err) {
-      console.error("Order confirmation message error:", err);
+      console.error("Order confirmation message error");
+      console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
@@ -648,7 +648,8 @@ async function sendFulfillmentMessage(fulfillment) {
       console.log("Fulfillment message sent:", response.data);
       console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
     } catch (err) {
-      console.error("Fulfillment message error:", err);
+      console.error("Fulfillment message error");
+      console.log(`Fulfillment message cannot be sent to (${cleanedPhone})`);
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
