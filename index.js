@@ -86,7 +86,7 @@ async function processQueue() {
   try {
     await handleAbandonedCheckoutMessage(checkout);
   } catch (err) {
-    console.error("Abandoned checkout message failed:", err);
+    console.error("Abandoned checkout message failed");
   } finally {
     isSending = false;
     setImmediate(processQueue);
@@ -140,7 +140,8 @@ async function handleAbandonedCheckoutMessage(checkout) {
     headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
   };
 
-  let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+  let imageUrl =
+    "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
 
   try {
     const variantRes = await axios.get(
@@ -198,11 +199,11 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.log("Abandoned checkout message sent:", response.data);
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
-    console.error("Abandoned checkout message error:", err);
+    console.log(`Abandoned checkout message not sent to (${cleanedPhone})`);
+    console.error("Abandoned checkout message error");
     if (err.response) {
       console.error("Response data:", err.response.data);
       console.error("Response status:", err.response.status);
-      console.error("Response headers:", err.response.headers);
     }
     throw err;
   }
@@ -232,16 +233,16 @@ async function createOrderFromPayment(checkout, payment, orderId) {
   }
 
   try {
-    await axios.delete(
-      `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/orders/${orderId}.json`,
-      {
-        headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    console.log(`✅ Deleted existing order with ID: ${orderId}`);
+    // await axios.delete(
+    //   `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/orders/${orderId}.json`,
+    //   {
+    //     headers: {
+    //       "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+    //       "Content-Type": "application/json",
+    //     },
+    //   }
+    // );
+    // console.log(`✅ Deleted existing order with ID: ${orderId}`);
   } catch (error) {
     console.error("Error deleting existing order:", error);
     if (error.response) {
@@ -391,8 +392,10 @@ async function verifyOrder(checkout) {
     console.log(`Found ${todaysPayments.items.length} payments for today.`);
 
     todaysPayments.items.map((payment) => {
+      console.log(payment);
       if (payment.status !== "captured") return;
-      if (payment.notes.cancelUrl.indexOf(checkout.cart_token) !== -1) {
+      if (payment?.notes?.cancelUrl === undefined) return;
+      if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
         createOrderFromPayment(checkout, payment, orderId);
       }
     });
@@ -457,7 +460,8 @@ async function sendOrderConfirmation(order) {
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
     // Fetch product image
-    let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+    let imageUrl =
+      "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
     if (order.line_items?.length) {
       const productId = order.line_items[0].product_id;
       const variantId = order.line_items[0].variant_id;
@@ -525,7 +529,6 @@ async function sendOrderConfirmation(order) {
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
-        console.error("Response headers:", err.response.headers);
       }
       throw err;
     }
@@ -574,7 +577,8 @@ async function sendFulfillmentMessage(fulfillment) {
     const fulfillmentStatusURL = fulfillment.tracking_url;
 
     // Product image
-    let imageUrl = "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+    let imageUrl =
+      "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
     if (fulfillment.line_items?.length > 0) {
       const productId = fulfillment.line_items[0].product_id;
       const variantId = fulfillment.line_items[0].variant_id;
@@ -648,7 +652,6 @@ async function sendFulfillmentMessage(fulfillment) {
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
-        console.error("Response headers:", err.response.headers);
       }
       throw err;
     }
