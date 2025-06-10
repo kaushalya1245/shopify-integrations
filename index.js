@@ -122,7 +122,7 @@ function saveSet(filePath, set, item) {
 // --- Abandoned Checkouts ---
 // Message queue and suppression logic
 const recentUsers = new Map();
-const USER_SUPPRESSION_WINDOW = 12 * 60 * 60 * 1000; // 12 Hours
+const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 12 Hours
 const SEND_MESSAGE_DELAY = 15 * 60 * 1000; // 15 Minutes delay
 let isSending = false;
 const messageQueue = [];
@@ -154,8 +154,9 @@ async function handleAbandonedCheckoutMessage(checkout) {
 
   let orders = [];
   try {
+    const phone = checkout.phone || checkout.shipping_address?.phone;
     const queryField = checkout.email ? "email" : "phone";
-    const queryValue = checkout.email || checkout.phone;
+    const queryValue = phone;
     const res = await client.get({
       path: "orders",
       query: {
@@ -354,7 +355,7 @@ async function createOrderFromPayment(checkout, payment) {
   }
 }
 
-async function verifyOrder(checkout) {
+async function verifyCheckout(checkout) {
   if (!checkout || !checkout.token) {
     console.log("No checkout token provided. Skipping payment fetch.");
     return;
@@ -372,7 +373,6 @@ async function verifyOrder(checkout) {
   }
 
   let orders = [];
-  let orderId = null;
   try {
     const phone = checkout.phone || checkout.shipping_address?.phone;
     if (!phone) {
@@ -424,18 +424,31 @@ async function verifyOrder(checkout) {
       console.log("No payments found for today.");
       return;
     }
-    console.log(`Found ${todaysPayments.items.length} payments for today.`);
 
-    todaysPayments.items.map((payment) => {
-      if (payment.status !== "captured") return;
+    const capturedPayments = todaysPayments.items.find((payment) => {
       if (payment?.notes?.cancelUrl === undefined) return;
       if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
-        console.log(
-          `Found captured payment for cart_token ${checkout.cart_token}: ${payment.id}`
-        );
-        createOrderFromPayment(checkout, payment);
+        return payment;
       }
     });
+
+    if (!capturedPayments) {
+      console.log(
+        `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`
+      );
+      messageQueue.push({ checkout });
+      processQueue();
+      return;
+    } else {
+      console.log(
+        `Captured payment found for checkout ${checkout.cart_token}:`,
+        capturedPayments.contact,
+        capturedPayments.id,
+        new Date(capturedPayments.created_at * 1000).toLocaleString()
+      );
+      await createOrderFromPayment(checkout, capturedPayments);
+      console.log(`Found ${todaysPayments.items.length} payments for today.`);
+    }
   } catch (error) {
     console.error("Error fetching payments:", error);
     throw error;
@@ -478,9 +491,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
   );
 
   setTimeout(() => {
-    messageQueue.push({ checkout });
-    processQueue();
-    verifyOrder(checkout);
+    verifyCheckout(checkout);
   }, SEND_MESSAGE_DELAY);
 });
 
