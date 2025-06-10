@@ -144,8 +144,14 @@ async function processQueue() {
 async function handleAbandonedCheckoutMessage(checkout) {
   if (!checkout.token) return;
 
-  if (!checkout.email && !checkout.phone && !checkout.shipping_address?.phone) {
-    console.log("Skipping incomplete checkout (missing contact info)");
+  if (
+    !checkout.email &&
+    !checkout?.phone &&
+    !checkout.shipping_address?.phone
+  ) {
+    console.log(
+      "Skipping incomplete checkout for sending message (missing contact info)"
+    );
     return;
   }
 
@@ -154,9 +160,9 @@ async function handleAbandonedCheckoutMessage(checkout) {
 
   let orders = [];
   try {
-    const phone = checkout.phone || checkout.shipping_address?.phone;
+    const phone = checkout?.phone || checkout?.shipping_address?.phone;
     const queryField = checkout.email ? "email" : "phone";
-    const queryValue = phone;
+    const queryValue = checkout.email || phone;
     const res = await client.get({
       path: "orders",
       query: {
@@ -214,7 +220,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.error("Failed to fetch product images:", err);
   }
 
-  let rawPhone = checkout.phone || checkout.shipping_address?.phone || "";
+  let rawPhone = checkout?.phone || checkout?.shipping_address?.phone || "";
   let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
   const payload = {
@@ -367,14 +373,18 @@ async function verifyCheckout(checkout) {
 
   if (!checkout.token) return;
 
-  if (!checkout.email && !checkout.phone && !checkout.shipping_address?.phone) {
+  if (
+    !checkout?.email &&
+    !checkout?.phone &&
+    !checkout?.shipping_address?.phone
+  ) {
     console.log("Skipping incomplete checkout (missing contact info)");
     return;
   }
 
   let orders = [];
   try {
-    const phone = checkout.phone || checkout.shipping_address?.phone;
+    const phone = checkout?.phone || checkout?.shipping_address?.phone;
     if (!phone) {
       console.log("No contact info available for checkout. Skipping.");
       return;
@@ -474,9 +484,9 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     return;
   }
 
-  const rawPhone = checkout.phone || checkout.shipping_address?.phone || "";
+  const rawPhone = checkout?.phone || checkout?.shipping_address?.phone || "";
 
-  if (rawPhone.replace(/\D/g, "").length >= 10) {
+  if (rawPhone.replace(/\D/g, "").length <= 10) {
     console.log("Missing contact info. Skipping...");
     return;
   }
