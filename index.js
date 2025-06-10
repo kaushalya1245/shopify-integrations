@@ -28,6 +28,54 @@ app.use(
   })
 );
 
+// async function getTodaysPayments() {
+//   console.log("Fetching today's payments from Razorpay...");
+//   if (!razorpayClient) {
+//     console.log("Razorpay client not initialized. Skipping payment fetch.");
+//     return;
+//   }
+//   if (!razorpayClient.fetchTodaysPayments) {
+//     console.log(
+//       "fetchTodaysPayments method not available. Skipping payment fetch."
+//     );
+//     return;
+//   }
+
+//   try {
+//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
+//     if (!todaysPayments || !todaysPayments.items) {
+//       console.log("No payments found for today.");
+//       return;
+//     }
+//     const capturedPayments = todaysPayments.items.filter(
+//       (payment) => payment.status === "captured"
+//     );
+//     console.log(`Found ${capturedPayments.length} payments for today.`);
+
+//     capturedPayments.map((payment) => {
+//       console.log(payment);
+//       console.log(new Date(payment.created_at * 1000).toLocaleString());
+
+//       if (payment?.notes?.cancelUrl === undefined) return;
+
+//       // if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
+//       //   createOrderFromPayment(checkout, payment, orderId);
+//       // }
+//     });
+//   } catch (error) {
+//     console.error("Error fetching payments:", error);
+//     throw error;
+//   }
+// }
+
+// getTodaysPayments()
+//   .then(() => {
+//     console.log("Today's payments fetched successfully.");
+//   })
+//   .catch((error) => {
+//     console.error("Error in fetching today's payments:", error);
+//   });
+
 // Shopify setup (shared)
 const shopify = shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
@@ -200,7 +248,9 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
     console.error("Abandoned checkout message error");
-    console.log(`Abandoned checkout message cannot be sent to (${cleanedPhone})`);
+    console.log(
+      `Abandoned checkout message cannot be sent to (${cleanedPhone})`
+    );
     if (err.response) {
       console.error("Response data:", err.response.data);
       console.error("Response status:", err.response.status);
@@ -222,33 +272,13 @@ function isRecentlyMessaged(checkout) {
   return false;
 }
 
-async function createOrderFromPayment(checkout, payment, orderId) {
+async function createOrderFromPayment(checkout, payment) {
   if (!checkout || !checkout.token) {
     console.log("No checkout token provided. Skipping order creation.");
     return;
   }
   if (!payment || !payment.id) {
     console.log("No payment ID provided. Skipping order creation.");
-    return;
-  }
-
-  try {
-    // await axios.delete(
-    //   `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/orders/${orderId}.json`,
-    //   {
-    //     headers: {
-    //       "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-    //       "Content-Type": "application/json",
-    //     },
-    //   }
-    // );
-    // console.log(`✅ Deleted existing order with ID: ${orderId}`);
-  } catch (error) {
-    console.error("Error deleting existing order:", error);
-    if (error.response) {
-      console.error("Response data:", error.response.data);
-      console.error("Response status:", error.response.status);
-    }
     return;
   }
 
@@ -344,8 +374,13 @@ async function verifyOrder(checkout) {
   let orders = [];
   let orderId = null;
   try {
+    const phone = checkout.phone || checkout.shipping_address?.phone;
+    if (!phone) {
+      console.log("No contact info available for checkout. Skipping.");
+      return;
+    }
     const queryField = checkout.email ? "email" : "phone";
-    const queryValue = checkout.email || checkout.phone;
+    const queryValue = checkout.email || phone;
     const res = await client.get({
       path: "orders",
       query: {
@@ -395,7 +430,10 @@ async function verifyOrder(checkout) {
       if (payment.status !== "captured") return;
       if (payment?.notes?.cancelUrl === undefined) return;
       if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
-        createOrderFromPayment(checkout, payment, orderId);
+        console.log(
+          `Found captured payment for cart_token ${checkout.cart_token}: ${payment.id}`
+        );
+        createOrderFromPayment(checkout, payment);
       }
     });
   } catch (error) {
@@ -409,6 +447,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 
   const checkout = req.body;
   const token = checkout?.token;
+  const cart_token = checkout?.cart_token;
   const eventType = req.headers["x-shopify-topic"];
 
   if (!token) {
@@ -434,7 +473,9 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     return;
   }
 
-  console.log(`[${eventType}] Queuing new message for token: ${token}`);
+  console.log(
+    `[${eventType}] Queuing new message for cart_token: ${cart_token}`
+  );
 
   setTimeout(() => {
     messageQueue.push({ checkout });
@@ -657,7 +698,7 @@ async function sendFulfillmentMessage(fulfillment) {
       throw err;
     }
   } catch (err) {
-    console.error("Fulfillment message error:", err);
+    console.error("Fulfillment message error");
   }
 }
 
