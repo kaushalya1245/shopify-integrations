@@ -214,7 +214,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.error("Failed to fetch product images:", err);
   }
 
-  let rawPhone = checkout.shipping_address?.phone || "";
+  let rawPhone = checkout.phone || checkout.shipping_address?.phone || "";
   let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
   const payload = {
@@ -250,7 +250,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
   } catch (err) {
     console.error("Abandoned checkout message error");
     console.log(
-      `Abandoned checkout message cannot be sent to (${cleanedPhone})`
+      `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`
     );
     if (err.response) {
       console.error("Response data:", err.response.data);
@@ -476,7 +476,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 
   const rawPhone = checkout.phone || checkout.shipping_address?.phone || "";
 
-  if (rawPhone.replace(/\D/g, "").length <= 10) {
+  if (rawPhone.replace(/\D/g, "").length >= 10) {
     console.log("Missing contact info. Skipping...");
     return;
   }
