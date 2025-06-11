@@ -53,7 +53,7 @@ app.use(
 //     console.log(`Found ${capturedPayments.length} payments for today.`);
 
 //     todaysPayments.items.map((payment) => {
-//       console.log(payment);
+//       // console.log(payment);
 //       console.log(new Date(payment.created_at * 1000).toLocaleString());
 
 //       if (payment?.notes?.cancelUrl === undefined) return;
@@ -123,7 +123,7 @@ function saveSet(filePath, set, item) {
 // Message queue and suppression logic
 const recentUsers = new Map();
 const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 12 Hours
-const SEND_MESSAGE_DELAY = 15 * 60 * 1000; // 15 Minutes delay
+const SEND_MESSAGE_DELAY = 1.5 * 60 * 1000; // 15 Minutes delay
 let isSending = false;
 const messageQueue = [];
 
@@ -489,6 +489,21 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 
   if (rawPhone.replace(/\D/g, "").length <= 10) {
     console.log("Missing contact info. Skipping...");
+    return;
+  }
+
+  if (
+    (checkout?.phone && checkout?.shipping_address?.first_name) ||
+    (checkout?.shipping_address?.phone &&
+      checkout?.shipping_address?.first_name)
+  ) {
+    console.log(
+      `[${eventType}] Checkout has contact info. Proceeding with message queueing.`
+    );
+  } else {
+    console.log(
+      `[${eventType}] Checkout missing contact info. Skipping message queueing.`
+    );
     return;
   }
 
