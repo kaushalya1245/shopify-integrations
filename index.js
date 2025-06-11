@@ -52,7 +52,7 @@ app.use(
 //     );
 //     console.log(`Found ${capturedPayments.length} payments for today.`);
 
-//     capturedPayments.map((payment) => {
+//     todaysPayments.items.map((payment) => {
 //       console.log(payment);
 //       console.log(new Date(payment.created_at * 1000).toLocaleString());
 
@@ -436,6 +436,7 @@ async function verifyCheckout(checkout) {
     }
 
     const capturedPayments = todaysPayments.items.find((payment) => {
+      if (payment.status !== "captured") return;
       if (payment?.notes?.cancelUrl === undefined) return;
       if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
         return payment;
