@@ -123,7 +123,7 @@ function saveSet(filePath, set, item) {
 // Message queue and suppression logic
 const recentUsers = new Map();
 const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 12 Hours
-const SEND_MESSAGE_DELAY = 1.5 * 60 * 1000; // 15 Minutes delay
+const SEND_MESSAGE_DELAY = 15 * 60 * 1000; // 15 Minutes delay
 let isSending = false;
 const messageQueue = [];
 
