@@ -1,7 +1,6 @@
 // shopify-webhooks-all-in-one.js
 require("dotenv").config();
 const express = require("express");
-const crypto = require("crypto");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -27,54 +26,6 @@ app.use(
     },
   })
 );
-
-// async function getTodaysPayments() {
-//   console.log("Fetching today's payments from Razorpay...");
-//   if (!razorpayClient) {
-//     console.log("Razorpay client not initialized. Skipping payment fetch.");
-//     return;
-//   }
-//   if (!razorpayClient.fetchTodaysPayments) {
-//     console.log(
-//       "fetchTodaysPayments method not available. Skipping payment fetch."
-//     );
-//     return;
-//   }
-
-//   try {
-//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
-//     if (!todaysPayments || !todaysPayments.items) {
-//       console.log("No payments found for today.");
-//       return;
-//     }
-//     const capturedPayments = todaysPayments.items.filter(
-//       (payment) => payment.status === "captured"
-//     );
-//     console.log(`Found ${capturedPayments.length} payments for today.`);
-
-//     todaysPayments.items.map((payment) => {
-//       // console.log(payment);
-//       console.log(new Date(payment.created_at * 1000).toLocaleString());
-
-//       if (payment?.notes?.cancelUrl === undefined) return;
-
-//       // if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
-//       //   createOrderFromPayment(checkout, payment, orderId);
-//       // }
-//     });
-//   } catch (error) {
-//     console.error("Error fetching payments:", error);
-//     throw error;
-//   }
-// }
-
-// getTodaysPayments()
-//   .then(() => {
-//     console.log("Today's payments fetched successfully.");
-//   })
-//   .catch((error) => {
-//     console.error("Error in fetching today's payments:", error);
-//   });
 
 // Shopify setup (shared)
 const shopify = shopifyApi({
@@ -122,8 +73,9 @@ function saveSet(filePath, set, item) {
 // --- Abandoned Checkouts ---
 // Message queue and suppression logic
 const recentUsers = new Map();
-const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 12 Hours
-const SEND_MESSAGE_DELAY = 15 * 60 * 1000; // 15 Minutes delay
+const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 1 Hours
+const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Update for production
+const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay // Update for production
 let isSending = false;
 const messageQueue = [];
 
@@ -217,7 +169,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
       imageUrl = matchedImage?.src || imageUrl;
     }
   } catch (err) {
-    console.error("Failed to fetch product images:", err);
+    console.error("Failed to fetch product images");
   }
 
   let rawPhone = checkout?.phone || checkout?.shipping_address?.phone || "";
@@ -262,7 +214,6 @@ async function handleAbandonedCheckoutMessage(checkout) {
       console.error("Response data:", err.response.data);
       console.error("Response status:", err.response.status);
     }
-    throw err;
   }
 }
 
@@ -292,51 +243,82 @@ async function createOrderFromPayment(checkout, payment) {
   const orderPayload = {
     order: {
       email: checkout.email,
-      phone: checkout.phone || checkout.shipping_address?.phone,
-      currency: checkout.currency,
-      // source_name: "web",
-      customer: checkout.customer || undefined,
-      billing_address: checkout.billing_address,
-      shipping_address: checkout.shipping_address,
+      phone:
+        checkout.phone ||
+        checkout.shipping_address?.phone ||
+        checkout.billing_address?.phone ||
+        undefined,
 
-      // line items
-      line_items: checkout.line_items.map((item) => ({
+      currency: checkout.currency || "INR",
+      customer: checkout.customer || undefined,
+
+      billing_address: {
+        first_name: checkout.billing_address?.first_name || "",
+        last_name: checkout.billing_address?.last_name || "",
+        address1: checkout.billing_address?.address1 || "",
+        address2: checkout.billing_address?.address2 || "",
+        city: checkout.billing_address?.city || "",
+        province: checkout.billing_address?.province || "",
+        country: checkout.billing_address?.country || "",
+        zip: checkout.billing_address?.zip || "",
+        phone: checkout.billing_address?.phone || "",
+      },
+
+      shipping_address: {
+        first_name: checkout.shipping_address?.first_name || "",
+        last_name: checkout.shipping_address?.last_name || "",
+        address1: checkout.shipping_address?.address1 || "",
+        address2: checkout.shipping_address?.address2 || "",
+        city: checkout.shipping_address?.city || "",
+        province: checkout.shipping_address?.province || "",
+        country: checkout.shipping_address?.country || "",
+        zip: checkout.shipping_address?.zip || "",
+        phone: checkout.shipping_address?.phone || "",
+      },
+
+      line_items: (checkout.line_items || []).map((item) => ({
         variant_id: item.variant_id,
-        quantity: item.quantity,
+        quantity: item.quantity || 1,
+        title: item.title || undefined,
+        price: parseFloat(item.price || 0).toFixed(2),
       })),
 
-      // shipping lines (mirrors the store UI)
       shipping_lines: [
         {
-          title: checkout.shipping_line?.title || "Standard",
-          price: checkout.shipping_line?.price || "0.00",
-          code: checkout.shipping_line?.code || "Standard",
-          // source: "shopify",
+          title: checkout?.shipping_lines[0]?.title || "Standard",
+          price: parseFloat(
+            checkout.shipping_lines[0]?.price ||
+              checkout?.shipping_lines[0]?.original_shop_price ||
+              0
+          ).toFixed(2), // Must not be 0
+          code: checkout.shipping_lines[0]?.code || "Standard",
+          source: "shopify",
         },
       ],
 
-      // tax lines (so Shopify shows IGST etc)
       tax_lines: (checkout.tax_lines || []).map((t) => ({
-        price: t.price,
+        price: parseFloat(t.price || 0).toFixed(2),
         rate: t.rate,
         title: t.title,
       })),
 
-      // financials
+      total_tax: parseFloat(checkout.total_tax || 0).toFixed(2),
+      total_discounts: parseFloat(checkout.total_discounts || 0).toFixed(2),
+
       financial_status: "paid",
+
       transactions: [
         {
           kind: "sale",
           status: "success",
-          amount: checkout.total_price,
+          amount: parseFloat(checkout.total_price || 0).toFixed(2), // Must match full total
           gateway: "razorpay",
           authorization: payment.id,
         },
       ],
 
-      // optional note/tag so you can skip it later
-      note: `Auto-created after Razorpay capture (${payment.id})`,
-      tags: "ManualOrder,RazorpayPaid",
+      note: `Auto-created after Razorpay capture (${payment.id})`, // Leave empty to avoid import warnings
+      tags: "ManualOrder, RazorpayPaid",
     },
   };
 
@@ -352,12 +334,97 @@ async function createOrderFromPayment(checkout, payment) {
       "✅ Order created from abandoned checkout:",
       orderResponse.body.order.id
     );
-  } catch (error) {
-    console.error("❌ Error creating order from checkout:", error);
-    if (error.response) {
-      console.error("Response data:", error.response.data);
-      console.error("Response status:", error.response.status);
+
+    try {
+      const locationRes = await client.get({ path: "locations" });
+      const locationId = locationRes.body.locations[0].id;
+      if (!locationId) {
+        console.error("No location ID found. Cannot adjust inventory.");
+        return;
+      }
+
+      const headers = {
+        headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+      };
+
+      orderResponse.body.order.line_items.forEach(async (item) => {
+        const deductionQuantity = item.quantity || 1;
+        const variantId = item?.variant_id || 0;
+        if (!variantId) {
+          console.log("No variant ID found for item:", item);
+          return;
+        }
+        try {
+          const variantRes = await axios.get(
+            `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
+            headers
+          );
+
+          if (!variantRes.data || !variantRes.data.variant) {
+            console.log(`No variant found for ID ${variantId}`);
+            return;
+          }
+          // Adjust inventory for the variant
+          console.log(
+            `Processing variant ${variantId} for inventory adjustment`
+          );
+          if (!variantRes.data.variant.inventory_item_id) {
+            console.log(`Variant ${variantId} has no inventory item ID`);
+            return;
+          }
+
+          const inventoryItemId = variantRes.data.variant.inventory_item_id;
+          if (!inventoryItemId) {
+            console.log("No inventory item ID found for variant:", variantId);
+            return;
+          }
+          console.log(
+            `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`
+          );
+
+          try {
+            if (orderResponse) {
+              const inventoryResponse = await client.post({
+                path: `inventory_levels/adjust`,
+                data: {
+                  location_id: locationId,
+                  inventory_item_id: inventoryItemId,
+                  available_adjustment: -deductionQuantity,
+                },
+                type: "application/json",
+              });
+              if (!inventoryResponse) {
+                console.error(
+                  `Failed to adjust inventory for variant ${variantId}:`,
+                  inventoryResponse
+                );
+              }
+            }
+          } catch (inventoryError) {
+            console.error(`Error adjusting inventory for variant ${variantId}`);
+            if (inventoryError.response) {
+              console.error("Response data:", inventoryError.response.data);
+              console.error("Response status:", inventoryError.response.status);
+            }
+          }
+        } catch (error) {
+          console.error(`Error adjusting inventory for variant ${variantId}`);
+          if (error.response) {
+            console.error("Response data:", error.response.data);
+            console.error("Response status:", error.response.status);
+          }
+        }
+      });
+    } catch (error) {
+      console.error("❌ Error creating order from checkout");
+      if (error.response) {
+        console.error("Response data:", error.response.data);
+        console.error("Response status:", error.response.status);
+      }
     }
+  } catch (locationError) {
+    console.error("Failed to fetch locations");
+    return;
   }
 }
 
@@ -401,6 +468,10 @@ async function verifyCheckout(checkout) {
       },
     });
     orders = res.body.orders;
+    if (!orders || orders.length === 0) {
+      console.log("No orders found for this checkout.");
+      return;
+    }
 
     const isOrderNotAbandoned = orders.find(
       (o) => o.cart_token === checkout.cart_token
@@ -410,7 +481,7 @@ async function verifyCheckout(checkout) {
       console.log(
         `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
       );
-      return;
+      return; // Uncomment for production
     } else {
       console.log(
         `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
@@ -422,7 +493,7 @@ async function verifyCheckout(checkout) {
       console.log(
         `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
       );
-      return;
+      return; // Uncomment for production
     }
   } catch (err) {
     console.error("Failed to fetch orders:", err);
@@ -438,7 +509,18 @@ async function verifyCheckout(checkout) {
     const capturedPayments = todaysPayments.items.find((payment) => {
       if (payment.status !== "captured") return;
       if (payment?.notes?.cancelUrl === undefined) return;
-      if (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) {
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      const thirtyMinutesAgo =
+        currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
+      if (
+        (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1 ||
+          (payment?.contact === checkout?.shipping_address?.phone &&
+            payment?.amount / 100 == Number(checkout.total_price)) ||
+          (payment?.contact === checkout?.phone &&
+            payment?.amount / 100 == Number(checkout.total_price))) &&
+        payment.created_at >= thirtyMinutesAgo &&
+        payment.created_at <= currentTimestamp
+      ) {
         return payment;
       }
     });
@@ -461,8 +543,7 @@ async function verifyCheckout(checkout) {
       console.log(`Found ${todaysPayments.items.length} payments for today.`);
     }
   } catch (error) {
-    console.error("Error fetching payments:", error);
-    throw error;
+    console.error("Error fetching payments");
   }
 }
 
@@ -608,10 +689,9 @@ async function sendOrderConfirmation(order) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
       }
-      throw err;
     }
   } catch (err) {
-    console.error("Order confirmation error:", err);
+    console.error("Order confirmation error");
   }
 }
 
@@ -732,7 +812,6 @@ async function sendFulfillmentMessage(fulfillment) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
       }
-      throw err;
     }
   } catch (err) {
     console.error("Fulfillment message error");
