@@ -769,10 +769,10 @@ async function sendFulfillmentMessage(fulfillment) {
       userName: name,
       source: "fulfillment",
       templateParams: [
-        name,
+        `${name}`,
         `${orderName}`,
         `${trackingNumber}`,
-        fulfillmentStatusURL,
+        `${fulfillmentStatusURL}`,
       ],
       media: {
         url: imageUrl,
