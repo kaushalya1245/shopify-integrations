@@ -125,6 +125,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
       },
     });
     orders = res.body.orders;
+
     const isOrderNotAbandoned = orders.find(
       (o) => o.cart_token === checkout.cart_token
     );
@@ -469,27 +470,31 @@ async function verifyCheckout(checkout) {
     });
     orders = res.body.orders;
 
-    const isOrderNotAbandoned = orders.find(
-      (o) => o.cart_token === checkout.cart_token
-    );
-    if (isOrderNotAbandoned) {
-      orderId = isOrderNotAbandoned.id;
-      console.log(
-        `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
+    if (orders) {
+      const isOrderNotAbandoned = orders.find(
+        (o) => o.cart_token === checkout.cart_token
       );
-      return; // Uncomment for production
-    } else {
-      console.log(
-        `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
-      );
-    }
+      if (isOrderNotAbandoned) {
+        orderId = isOrderNotAbandoned.id;
+        console.log(
+          `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
+        );
+        return; // Uncomment for production
+      } else {
+        console.log(
+          `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
+        );
+      }
 
-    const isConverted = orders.find((o) => o.checkout_token === checkout.token);
-    if (isConverted) {
-      console.log(
-        `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
+      const isConverted = orders.find(
+        (o) => o.checkout_token === checkout.token
       );
-      return; // Uncomment for production
+      if (isConverted) {
+        console.log(
+          `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
+        );
+        return; // Uncomment for production
+      }
     }
   } catch (err) {
     console.error("Failed to fetch orders:", err);
@@ -499,44 +504,43 @@ async function verifyCheckout(checkout) {
     const todaysPayments = await razorpayClient.fetchTodaysPayments();
     if (!todaysPayments || !todaysPayments.items) {
       console.log("No payments found for today.");
-      return;
-    }
-
-    const capturedPayments = todaysPayments.items.find((payment) => {
-      if (payment.status !== "captured") return;
-      if (payment?.notes?.cancelUrl === undefined) return;
-      const currentTimestamp = Math.floor(Date.now() / 1000);
-      const thirtyMinutesAgo =
-        currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
-      if (
-        (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1 ||
-          (payment?.contact === checkout?.shipping_address?.phone &&
-            payment?.amount / 100 == Number(checkout.total_price)) ||
-          (payment?.contact === checkout?.phone &&
-            payment?.amount / 100 == Number(checkout.total_price))) &&
-        payment.created_at >= thirtyMinutesAgo &&
-        payment.created_at <= currentTimestamp
-      ) {
-        return payment;
-      }
-    });
-
-    if (!capturedPayments) {
-      console.log(
-        `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`
-      );
-      messageQueue.push({ checkout });
-      processQueue();
-      return;
     } else {
-      console.log(
-        `Captured payment found for checkout ${checkout.cart_token}:`,
-        capturedPayments.contact,
-        capturedPayments.id,
-        new Date(capturedPayments.created_at * 1000).toLocaleString()
-      );
-      await createOrderFromPayment(checkout, capturedPayments);
-      console.log(`Found ${todaysPayments.items.length} payments for today.`);
+      const capturedPayments = todaysPayments.items.find((payment) => {
+        if (payment.status !== "captured") return;
+        if (payment?.notes?.cancelUrl === undefined) return;
+        const currentTimestamp = Math.floor(Date.now() / 1000);
+        const thirtyMinutesAgo =
+          currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
+        if (
+          (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1 ||
+            (payment?.contact === checkout?.shipping_address?.phone &&
+              payment?.amount / 100 == Number(checkout.total_price)) ||
+            (payment?.contact === checkout?.phone &&
+              payment?.amount / 100 == Number(checkout.total_price))) &&
+          payment.created_at >= thirtyMinutesAgo &&
+          payment.created_at <= currentTimestamp
+        ) {
+          return payment;
+        }
+      });
+
+      if (!capturedPayments) {
+        console.log(
+          `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`
+        );
+        messageQueue.push({ checkout });
+        processQueue();
+        return;
+      } else {
+        console.log(
+          `Captured payment found for checkout ${checkout.cart_token}:`,
+          capturedPayments.contact,
+          capturedPayments.id,
+          new Date(capturedPayments.created_at * 1000).toLocaleString()
+        );
+        await createOrderFromPayment(checkout, capturedPayments);
+        console.log(`Found ${todaysPayments.items.length} payments for today.`);
+      }
     }
   } catch (error) {
     console.error("Error fetching payments");
