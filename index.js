@@ -468,10 +468,6 @@ async function verifyCheckout(checkout) {
       },
     });
     orders = res.body.orders;
-    if (!orders || orders.length === 0) {
-      console.log("No orders found for this checkout.");
-      return;
-    }
 
     const isOrderNotAbandoned = orders.find(
       (o) => o.cart_token === checkout.cart_token
