@@ -27,6 +27,15 @@ app.use(
   })
 );
 
+// Message queue and suppression logic
+const recentUsers = new Map();
+const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Update for production
+// const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 1 Hours
+const USER_SUPPRESSION_WINDOW = SEND_MESSAGE_DELAY; // Same send message delay
+const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay // Update for production
+let isSending = false;
+const messageQueue = [];
+
 // Shopify setup (shared)
 const shopify = shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
@@ -57,27 +66,51 @@ const dataFiles = {
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
 };
 
-function loadSet(filePath) {
+// function loadSet(filePath) {
+//   try {
+//     return new Set(JSON.parse(fs.readFileSync(filePath)));
+//   } catch {
+//     return new Set();
+//   }
+// }
+
+// function saveSet(filePath, set, item) {
+//   set.add(item);
+//   fs.writeFileSync(filePath, JSON.stringify(Array.from(set)));
+// }
+
+function loadSet(filePath, type = "set") {
   try {
-    return new Set(JSON.parse(fs.readFileSync(filePath)));
+    const raw = JSON.parse(fs.readFileSync(filePath));
+    if (type === "timestamp") {
+      // Remove expired tokens
+      const now = Date.now();
+      const valid = {};
+      for (const [token, timestamp] of Object.entries(raw)) {
+        if (now - timestamp < SEND_MESSAGE_DELAY) {
+          valid[token] = timestamp;
+        }
+      }
+      return valid;
+    } else {
+      return new Set(raw);
+    }
   } catch {
-    return new Set();
+    return type === "timestamp" ? {} : new Set();
   }
 }
 
-function saveSet(filePath, set, item) {
-  set.add(item);
-  fs.writeFileSync(filePath, JSON.stringify(Array.from(set)));
+function saveSet(filePath, dataset, item, type = "set") {
+  if (type === "timestamp") {
+    dataset[item] = Date.now();
+    fs.writeFileSync(filePath, JSON.stringify(dataset, null, 2));
+  } else {
+    dataset.add(item);
+    fs.writeFileSync(filePath, JSON.stringify(Array.from(dataset)));
+  }
 }
 
 // --- Abandoned Checkouts ---
-// Message queue and suppression logic
-const recentUsers = new Map();
-const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 1 Hours
-const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Update for production
-const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay // Update for production
-let isSending = false;
-const messageQueue = [];
 
 async function processQueue() {
   if (isSending || messageQueue.length === 0) return;
@@ -86,15 +119,42 @@ async function processQueue() {
   try {
     await handleAbandonedCheckoutMessage(checkout);
   } catch (err) {
-    console.error("Abandoned checkout message failed");
+    console.error("Abandoned checkout message failed", err);
   } finally {
     isSending = false;
     setImmediate(processQueue);
   }
 }
 
+// async function fetchPayments() {
+//   try {
+//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
+//     if (!todaysPayments || !todaysPayments.items) {
+//       console.log("No payments found for today.");
+//       return;
+//     }
+
+//     todaysPayments.items.map((payment) => {
+//       if (payment.status !== "captured") return;
+//       console.log(payment);
+//       if (payment?.notes?.cancelUrl === undefined) return;
+//     });
+
+//     const capturedPayments = todaysPayments.items.filter(
+//       (payment) => payment.status === "captured"
+//     );
+
+//     console.log(capturedPayments.length, "payments found for today.");
+//   } catch (error) {
+//     console.error("Error fetching payments");
+//   }
+// }
+
+// fetchPayments(); // Comment for production
+
 async function handleAbandonedCheckoutMessage(checkout) {
   if (!checkout.token) return;
+  const token = checkout.token;
 
   if (
     !checkout.email &&
@@ -107,8 +167,11 @@ async function handleAbandonedCheckoutMessage(checkout) {
     return;
   }
 
-  const processedTokens = loadSet(dataFiles.tokens);
-  if (processedTokens.has(checkout.token)) return;
+  const processedTokens = loadSet(dataFiles.tokens, "timestamp");
+  if (token in processedTokens) {
+    console.log(token, " token is already processed. Skipping.");
+    return;
+  }
 
   let orders = [];
   try {
@@ -134,7 +197,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     const isConverted = orders.find((o) => o.checkout_token === checkout.token);
     if (isConverted) return;
   } catch (err) {
-    console.error("Failed to fetch orders:", err);
+    console.error("Failed to fetch orders");
   }
 
   const name = checkout.shipping_address?.first_name || "Customer";
@@ -203,13 +266,16 @@ async function handleAbandonedCheckoutMessage(checkout) {
       "https://backend.aisensy.com/campaign/t1/api/v2",
       payload
     );
-    saveSet(dataFiles.tokens, processedTokens, checkout.token);
+    saveSet(dataFiles.tokens, processedTokens, checkout.token, "timestamp");
+    setTimeout(() => {
+      loadSet(dataFiles.tokens, "timestamp");
+    }, 1 * 60 * 1000); // Delay for 1 minute for deleting old tokens
     console.log(
       `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
     );
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
-    console.error("Abandoned checkout message error");
+    console.error("Abandoned checkout message error: ", err);
     console.log(
       `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`
     );
@@ -565,8 +631,8 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     return;
   }
 
-  const processedTokens = loadSet(dataFiles.tokens);
-  if (processedTokens.has(token)) {
+  const processedTokens = loadSet(dataFiles.tokens, "timestamp");
+  if (token in processedTokens) {
     console.log(`[${eventType}] Already processed token: ${token}`);
     return;
   }
@@ -608,7 +674,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 });
 
 // --- Order Confirmation ---
-const processedOrders = loadSet(dataFiles.orders);
+const processedOrders = loadSet(dataFiles.orders, "set");
 
 async function sendOrderConfirmation(order) {
   try {
@@ -646,7 +712,7 @@ async function sendOrderConfirmation(order) {
           ).src.split("?")[0];
         }
       } catch (imageError) {
-        console.error("Failed to fetch product image:", imageError);
+        console.error("Failed to fetch product image");
       }
     }
 
@@ -684,7 +750,7 @@ async function sendOrderConfirmation(order) {
         "https://backend.aisensy.com/campaign/t1/api/v2",
         payload
       );
-      saveSet(dataFiles.orders, processedOrders, order.id.toString());
+      saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
       console.log(
         `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
       );
@@ -715,7 +781,7 @@ app.post("/webhook/order-confirmation", (req, res) => {
 });
 
 // --- Fulfillment Creation ---
-const processedFulfillments = loadSet(dataFiles.fulfillments);
+const processedFulfillments = loadSet(dataFiles.fulfillments, "set");
 
 async function sendFulfillmentMessage(fulfillment) {
   try {
@@ -808,7 +874,8 @@ async function sendFulfillmentMessage(fulfillment) {
       saveSet(
         dataFiles.fulfillments,
         processedFulfillments,
-        fulfillment.id.toString()
+        fulfillment.id.toString(),
+        "set"
       );
       console.log("Fulfillment message sent:", response.data);
       console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
