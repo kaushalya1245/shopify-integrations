@@ -112,7 +112,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
 
   let orders = [];
   try {
-    const phone = checkout?.phone || checkout?.shipping_address?.phone;
+    const phone = checkout?.shipping_address?.phone || checkout?.phone;
     const queryField = checkout.email ? "email" : "phone";
     const queryValue = checkout.email || phone;
     const res = await client.get({
@@ -173,7 +173,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.error("Failed to fetch product images");
   }
 
-  let rawPhone = checkout?.phone || checkout?.shipping_address?.phone || "";
+  let rawPhone = checkout?.shipping_address?.phone || checkout?.phone || "";
   let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
 
   const payload = {
@@ -204,7 +204,9 @@ async function handleAbandonedCheckoutMessage(checkout) {
       payload
     );
     saveSet(dataFiles.tokens, processedTokens, checkout.token);
-    console.log("Abandoned checkout message sent:", response.data);
+    console.log(
+      `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
+    );
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
     console.error("Abandoned checkout message error");
@@ -452,7 +454,7 @@ async function verifyCheckout(checkout) {
 
   let orders = [];
   try {
-    const phone = checkout?.phone || checkout?.shipping_address?.phone;
+    const phone = checkout?.shipping_address?.phone || checkout?.phone;
     if (!phone) {
       console.log("No contact info available for checkout. Skipping.");
       return;
@@ -554,6 +556,9 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
   const token = checkout?.token;
   const cart_token = checkout?.cart_token;
   const eventType = req.headers["x-shopify-topic"];
+  if (cart_token) {
+    console.log(`[${eventType}] Processing cart_token: ${cart_token}`);
+  }
 
   if (!token) {
     console.log(`[${eventType}] Missing token. Ignored.`);
@@ -566,17 +571,17 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     return;
   }
 
-  const rawPhone = checkout?.phone || checkout?.shipping_address?.phone || "";
+  const rawPhone = checkout?.shipping_address?.phone || checkout?.phone || "";
 
-  if (rawPhone.replace(/\D/g, "").length <= 10) {
+  if (rawPhone.replace(/\D/g, "").length < 10) {
     console.log("Missing contact info. Skipping...");
     return;
   }
 
   if (
-    (checkout?.phone && checkout?.shipping_address?.first_name) ||
     (checkout?.shipping_address?.phone &&
-      checkout?.shipping_address?.first_name)
+      checkout?.shipping_address?.first_name) ||
+    (checkout?.phone && checkout?.shipping_address?.first_name)
   ) {
     console.log(
       `[${eventType}] Checkout has contact info. Proceeding with message queueing.`
@@ -680,7 +685,9 @@ async function sendOrderConfirmation(order) {
         payload
       );
       saveSet(dataFiles.orders, processedOrders, order.id.toString());
-      console.log("Order confirmation message sent:", response.data);
+      console.log(
+        `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
+      );
       console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error("Order confirmation message error");
