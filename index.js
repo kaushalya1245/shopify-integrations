@@ -261,7 +261,6 @@ async function handleAbandonedCheckoutMessage(checkout) {
   };
 
   try {
-    // Uncomment the following lines to send the message via AISensy
     const response = await axios.post(
       "https://backend.aisensy.com/campaign/t1/api/v2",
       payload
@@ -309,6 +308,20 @@ async function createOrderFromPayment(checkout, payment) {
     return;
   }
 
+  const rawPhone =
+    checkout.phone ||
+    checkout.shipping_address?.phone ||
+    checkout.billing_address?.phone ||
+    "";
+
+  const sanitizedPhone = rawPhone.replace(/\D/g, ""); // remove all non-digits
+
+  // Prefix country code if missing
+  const formattedPhone =
+    sanitizedPhone.length === 10
+      ? `+91${sanitizedPhone}`
+      : `+${sanitizedPhone}`;
+
   const orderPayload = {
     order: {
       email: checkout.email,
@@ -319,7 +332,21 @@ async function createOrderFromPayment(checkout, payment) {
         undefined,
 
       currency: checkout.currency || "INR",
-      customer: checkout.customer || undefined,
+
+      customer: {
+        first_name:
+          checkout.customer?.first_name ||
+          checkout.shipping_address?.first_name ||
+          checkout.billing_address?.first_name ||
+          "Guest",
+        last_name:
+          checkout.customer?.last_name ||
+          checkout.shipping_address?.last_name ||
+          checkout.billing_address?.last_name ||
+          "",
+        email: checkout.email,
+        phone: formattedPhone,
+      },
 
       billing_address: {
         first_name: checkout.billing_address?.first_name || "",
@@ -359,7 +386,7 @@ async function createOrderFromPayment(checkout, payment) {
             checkout.shipping_lines[0]?.price ||
               checkout?.shipping_lines[0]?.original_shop_price ||
               0
-          ).toFixed(2), // Must not be 0
+          ).toFixed(2),
           code: checkout.shipping_lines[0]?.code || "Standard",
           source: "shopify",
         },
@@ -380,13 +407,13 @@ async function createOrderFromPayment(checkout, payment) {
         {
           kind: "sale",
           status: "success",
-          amount: parseFloat(checkout.total_price || 0).toFixed(2), // Must match full total
+          amount: parseFloat(checkout.total_price || 0).toFixed(2),
           gateway: "razorpay",
           authorization: payment.id,
         },
       ],
 
-      note: `Auto-created after Razorpay capture (${payment.id})`, // Leave empty to avoid import warnings
+      note: `Auto-created after Razorpay capture (${payment.id})`,
       tags: "ManualOrder, RazorpayPaid",
     },
   };
@@ -433,7 +460,7 @@ async function createOrderFromPayment(checkout, payment) {
             console.log(`No variant found for ID ${variantId}`);
             return;
           }
-          // Adjust inventory for the variant
+
           console.log(
             `Processing variant ${variantId} for inventory adjustment`
           );
@@ -492,7 +519,7 @@ async function createOrderFromPayment(checkout, payment) {
       }
     }
   } catch (locationError) {
-    console.error("Failed to fetch locations");
+    console.error("Failed to fetch locations: ", locationError);
     return;
   }
 }
