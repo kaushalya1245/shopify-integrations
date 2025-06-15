@@ -603,15 +603,21 @@ async function verifyCheckout(checkout) {
       const capturedPayments = todaysPayments.items.find((payment) => {
         if (payment.status !== "captured") return;
         if (payment?.notes?.cancelUrl === undefined) return;
+        const perfectPhoneDigits = payment?.contact
+          .replace(/\s+/g, "")
+          .slice(-10);
+        console.log(perfectPhoneDigits);
+        const perfectAmount = payment?.amount / 100;
+        const totalCheckoutPrice = Number(checkout.total_price);
         const currentTimestamp = Math.floor(Date.now() / 1000);
         const thirtyMinutesAgo =
           currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
         if (
-          (payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1 ||
-            (payment?.contact === checkout?.shipping_address?.phone &&
-              payment?.amount / 100 == Number(checkout.total_price)) ||
+          ((perfectPhoneDigits === checkout?.shipping_address?.phone &&
+            perfectAmount == totalCheckoutPrice) ||
             (payment?.contact === checkout?.phone &&
-              payment?.amount / 100 == Number(checkout.total_price))) &&
+              perfectAmount == totalCheckoutPrice) ||
+            payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) &&
           payment.created_at >= thirtyMinutesAgo &&
           payment.created_at <= currentTimestamp
         ) {
