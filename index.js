@@ -13,7 +13,7 @@ const { nodeAdapter } = require("@shopify/shopify-api/adapters/node");
 const { razorpayClient } = require("./razorpayClient");
 
 const app = express();
-// Logging middleware
+
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
@@ -30,7 +30,6 @@ app.use(
 // Message queue and suppression logic
 const recentUsers = new Map();
 const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Update for production
-// const USER_SUPPRESSION_WINDOW = 1 * 60 * 60 * 1000; // 1 Hours
 const USER_SUPPRESSION_WINDOW = SEND_MESSAGE_DELAY; // Same send message delay
 const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay // Update for production
 let isSending = false;
@@ -64,26 +63,13 @@ const dataFiles = {
   tokens: path.resolve(__dirname, "processed-tokens.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
+  payments: path.resolve(__dirname, "processed-payments.json"),
 };
-
-// function loadSet(filePath) {
-//   try {
-//     return new Set(JSON.parse(fs.readFileSync(filePath)));
-//   } catch {
-//     return new Set();
-//   }
-// }
-
-// function saveSet(filePath, set, item) {
-//   set.add(item);
-//   fs.writeFileSync(filePath, JSON.stringify(Array.from(set)));
-// }
 
 function loadSet(filePath, type = "set") {
   try {
     const raw = JSON.parse(fs.readFileSync(filePath));
     if (type === "timestamp") {
-      // Remove expired tokens
       const now = Date.now();
       const valid = {};
       for (const [token, timestamp] of Object.entries(raw)) {
@@ -125,32 +111,6 @@ async function processQueue() {
     setImmediate(processQueue);
   }
 }
-
-// async function fetchPayments() {
-//   try {
-//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
-//     if (!todaysPayments || !todaysPayments.items) {
-//       console.log("No payments found for today.");
-//       return;
-//     }
-
-//     todaysPayments.items.map((payment) => {
-//       if (payment.status !== "captured") return;
-//       console.log(payment);
-//       if (payment?.notes?.cancelUrl === undefined) return;
-//     });
-
-//     const capturedPayments = todaysPayments.items.filter(
-//       (payment) => payment.status === "captured"
-//     );
-
-//     console.log(capturedPayments.length, "payments found for today.");
-//   } catch (error) {
-//     console.error("Error fetching payments");
-//   }
-// }
-
-// fetchPayments(); // Comment for production
 
 async function handleAbandonedCheckoutMessage(checkout) {
   if (!checkout.token) return;
@@ -333,7 +293,7 @@ async function createOrderFromPayment(checkout, payment) {
 
       currency: checkout.currency || "INR",
 
-      customer: {
+      customer: checkout.customer || {
         first_name:
           checkout.customer?.first_name ||
           checkout.shipping_address?.first_name ||
@@ -596,6 +556,8 @@ async function verifyCheckout(checkout) {
   }
 
   try {
+    const processedPayments = loadSet(dataFiles.payments, "set");
+
     const todaysPayments = await razorpayClient.fetchTodaysPayments();
     if (!todaysPayments || !todaysPayments.items) {
       console.log("No payments found for today.");
@@ -606,7 +568,6 @@ async function verifyCheckout(checkout) {
         const perfectPhoneDigits = payment?.contact
           .replace(/\s+/g, "")
           .slice(-10);
-        console.log(perfectPhoneDigits);
         const perfectAmount = payment?.amount / 100;
         const totalCheckoutPrice = Number(checkout.total_price);
         const currentTimestamp = Math.floor(Date.now() / 1000);
@@ -632,16 +593,24 @@ async function verifyCheckout(checkout) {
         messageQueue.push({ checkout });
         processQueue();
         return;
-      } else {
-        console.log(
-          `Captured payment found for checkout ${checkout.cart_token}:`,
-          capturedPayments.contact,
-          capturedPayments.id,
-          new Date(capturedPayments.created_at * 1000).toLocaleString()
-        );
-        await createOrderFromPayment(checkout, capturedPayments);
-        console.log(`Found ${todaysPayments.items.length} payments for today.`);
       }
+
+      if (processedPayments.has(capturedPayments.id)) {
+        console.log(
+          `Payment ${capturedPayments.id} already processed. Skipping.`
+        );
+        return;
+      }
+
+      console.log(
+        `Captured payment found for checkout ${checkout.cart_token}:`,
+        capturedPayments.contact,
+        capturedPayments.id,
+        new Date(capturedPayments.created_at * 1000).toLocaleString()
+      );
+
+      saveSet(dataFiles.payments, processedPayments, capturedPayments.id);
+      await createOrderFromPayment(checkout, capturedPayments);
     }
   } catch (error) {
     console.error("Error fetching payments");
