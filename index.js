@@ -314,10 +314,36 @@ async function createOrderFromPayment(checkout, payment) {
       path: "customers/search",
       query: { phone: `${formattedPhone}` },
     });
-    customerId = res.body.customers?.[0]?.id || null;
+    if (res.body.customers?.length > 0) {
+      customerId = res.body.customers?.[0]?.id || null;
+      console.log("Found customer id:", customerId);
+    } else {
+      console.log("ℹ️ No existing customer found with phone:", formattedPhone);
+    }
   } catch (error) {
     console.error("Error fetching customer by phone:", error);
     return;
+  }
+
+  let customerData = null;
+
+  if (checkout.customer) {
+    customerData = checkout.customer;
+  } else if (customerId) {
+    customerData = { id: customerId };
+  } else {
+    customerData = {
+      first_name:
+        checkout.shipping_address?.first_name ||
+        checkout.billing_address?.first_name ||
+        "Guest",
+      last_name:
+        checkout.shipping_address?.last_name ||
+        checkout.billing_address?.last_name ||
+        "",
+      email: checkout.email,
+      phone: formattedPhone, // Make sure this is validated
+    };
   }
 
   const orderPayload = {
@@ -331,7 +357,7 @@ async function createOrderFromPayment(checkout, payment) {
 
       currency: checkout.currency || "INR",
 
-      customer: {id: customerId || undefined},
+      customer: customerData,
 
       billing_address: {
         first_name: checkout.billing_address?.first_name || "",
