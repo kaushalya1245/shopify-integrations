@@ -29,9 +29,9 @@ app.use(
 
 // Message queue and suppression logic
 const recentUsers = new Map();
-const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Update for production
+const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Change
 const USER_SUPPRESSION_WINDOW = SEND_MESSAGE_DELAY; // Same send message delay
-const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay // Update for production
+const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay
 let isSending = false;
 const messageQueue = [];
 
@@ -111,6 +111,32 @@ async function processQueue() {
     setImmediate(processQueue);
   }
 }
+
+// async function fetchPayments() {
+//   try {
+//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
+//     if (!todaysPayments || !todaysPayments.items) {
+//       console.log("No payments found for today.");
+//       return;
+//     }
+
+//     todaysPayments.items.map((payment) => {
+//       if (payment.status !== "captured") return;
+//       console.log(payment);
+//       if (payment?.notes?.cancelUrl === undefined) return;
+//     });
+
+//     const capturedPayments = todaysPayments.items.filter(
+//       (payment) => payment.status === "captured"
+//     );
+
+//     console.log(capturedPayments.length, "payments found for today.");
+//   } catch (error) {
+//     console.error("Error fetching payments");
+//   }
+// }
+
+// fetchPayments(); // Change
 
 async function handleAbandonedCheckoutMessage(checkout) {
   if (!checkout.token) return;
@@ -224,7 +250,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     const response = await axios.post(
       "https://backend.aisensy.com/campaign/t1/api/v2",
       payload
-    );
+    ); // Change
     saveSet(dataFiles.tokens, processedTokens, checkout.token, "timestamp");
     setTimeout(() => {
       loadSet(dataFiles.tokens, "timestamp");
@@ -282,6 +308,18 @@ async function createOrderFromPayment(checkout, payment) {
       ? `+91${sanitizedPhone}`
       : `+${sanitizedPhone}`;
 
+  let customerId = null;
+  try {
+    const res = await client.get({
+      path: "customers/search",
+      query: { phone: `${formattedPhone}` },
+    });
+    customerId = res.body.customers?.[0]?.id || null;
+  } catch (error) {
+    console.error("Error fetching customer by phone:", error);
+    return;
+  }
+
   const orderPayload = {
     order: {
       email: checkout.email,
@@ -293,20 +331,7 @@ async function createOrderFromPayment(checkout, payment) {
 
       currency: checkout.currency || "INR",
 
-      customer: checkout.customer || {
-        first_name:
-          checkout.customer?.first_name ||
-          checkout.shipping_address?.first_name ||
-          checkout.billing_address?.first_name ||
-          "Guest",
-        last_name:
-          checkout.customer?.last_name ||
-          checkout.shipping_address?.last_name ||
-          checkout.billing_address?.last_name ||
-          "",
-        email: checkout.email,
-        phone: formattedPhone,
-      },
+      customer: {id: customerId || undefined},
 
       billing_address: {
         first_name: checkout.billing_address?.first_name || "",
@@ -534,7 +559,7 @@ async function verifyCheckout(checkout) {
         console.log(
           `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
         );
-        return; // Uncomment for production
+        return; // Change
       } else {
         console.log(
           `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
@@ -548,7 +573,7 @@ async function verifyCheckout(checkout) {
         console.log(
           `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
         );
-        return; // Uncomment for production
+        return; // Change
       }
     }
   } catch (err) {
@@ -751,7 +776,7 @@ async function sendOrderConfirmation(order) {
       const response = await axios.post(
         "https://backend.aisensy.com/campaign/t1/api/v2",
         payload
-      );
+      ); // Change
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
       console.log(
         `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
@@ -872,7 +897,7 @@ async function sendFulfillmentMessage(fulfillment) {
       const response = await axios.post(
         "https://backend.aisensy.com/campaign/t1/api/v2",
         payload
-      );
+      ); // Change
       saveSet(
         dataFiles.fulfillments,
         processedFulfillments,
