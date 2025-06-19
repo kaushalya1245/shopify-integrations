@@ -134,6 +134,7 @@ async function processQueue() {
 //   } catch (error) {
 //     console.error("Error fetching payments");
 //   }
+
 // }
 
 // fetchPayments(); // Change
@@ -307,6 +308,46 @@ async function createOrderFromPayment(checkout, payment) {
     sanitizedPhone.length === 10
       ? `+91${sanitizedPhone}`
       : `+${sanitizedPhone}`;
+
+  const getOrdersFromPast = new Date(
+    Date.now() - SEND_MESSAGE_DELAY
+  ).toISOString();
+  try {
+    const phone = checkout?.shipping_address?.phone || checkout?.phone;
+    if (!phone) {
+      console.log("No contact info available for checkout. Skipping.");
+      return;
+    }
+    const queryField = checkout.email ? "email" : "phone";
+    const queryValue = checkout.email || phone;
+    const targetPrice = parseFloat(checkout.total_price || "0");
+    const res = await client.get({
+      path: "orders",
+      query: {
+        [queryField]: queryValue,
+        created_at_min: getOrdersFromPast,
+        status: "any",
+        limit: 5,
+      },
+    });
+
+    if (res.body.orders.length > 0) {
+      const matchingOrder = res.body.orders.find((item) => {
+        const orderPrice = parseFloat(item.total_price || "0");
+        return orderPrice === targetPrice;
+      });
+
+      if (matchingOrder) {
+        console.log("✅ Matching recent order found. Skipping order creation.");
+        return;
+      }
+    }
+
+    console.log("ℹ️ No matching orders found. Proceeding with order creation.");
+  } catch (error) {
+    console.error("Error fetching customer by phone:", error);
+    return;
+  }
 
   let customerId = null;
   try {
@@ -697,11 +738,17 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     return;
   }
 
-  if (
-    (checkout?.shipping_address?.phone &&
-      checkout?.shipping_address?.first_name) ||
-    (checkout?.phone && checkout?.shipping_address?.first_name)
-  ) {
+  const shipping = checkout?.shipping_address || {};
+  const hasContactInfo =
+    (shipping.phone || checkout.phone) &&
+    (checkout.customer?.first_name || shipping.first_name) &&
+    shipping.address1 &&
+    shipping.city &&
+    shipping.province &&
+    shipping.country &&
+    shipping.zip;
+
+  if (hasContactInfo) {
     console.log(
       `[${eventType}] Checkout has contact info. Proceeding with message queueing.`
     );
