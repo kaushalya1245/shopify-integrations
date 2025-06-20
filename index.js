@@ -28,9 +28,8 @@ app.use(
 );
 
 // Message queue and suppression logic
-const recentUsers = new Map();
+const CHECK_INTERVAL = 60 * 1000; // 1 minute
 const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Change
-const USER_SUPPRESSION_WINDOW = SEND_MESSAGE_DELAY; // Same send message delay
 const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay
 let isSending = false;
 const messageQueue = [];
@@ -60,7 +59,7 @@ const client = new shopify.clients.Rest({ session });
 
 // --- Helpers for persistence ---
 const dataFiles = {
-  tokens: path.resolve(__dirname, "processed-tokens.json"),
+  checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
   payments: path.resolve(__dirname, "processed-payments.json"),
@@ -68,27 +67,25 @@ const dataFiles = {
 
 function loadSet(filePath, type = "set") {
   try {
-    const raw = JSON.parse(fs.readFileSync(filePath));
-    if (type === "timestamp") {
-      const now = Date.now();
-      const valid = {};
-      for (const [token, timestamp] of Object.entries(raw)) {
-        if (now - timestamp < SEND_MESSAGE_DELAY) {
-          valid[token] = timestamp;
-        }
-      }
-      return valid;
-    } else {
-      return new Set(raw);
-    }
+    const data = JSON.parse(fs.readFileSync(filePath));
+    if (type === "set") return new Set(data);
+    return data;
   } catch {
-    return type === "timestamp" ? {} : new Set();
+    return type === "set" ? new Set() : {};
   }
 }
 
 function saveSet(filePath, dataset, item, type = "set") {
-  if (type === "timestamp") {
-    dataset[item] = Date.now();
+  if (type === "debounced") {
+    const { cart_token, checkout } = item;
+    if (!cart_token || !checkout) {
+      console.warn("Invalid debounced item");
+      return;
+    }
+    dataset[cart_token] = {
+      checkout,
+      updatedAt: Date.now(),
+    };
     fs.writeFileSync(filePath, JSON.stringify(dataset, null, 2));
   } else {
     dataset.add(item);
@@ -134,15 +131,11 @@ async function processQueue() {
 //   } catch (error) {
 //     console.error("Error fetching payments");
 //   }
-
 // }
 
 // fetchPayments(); // Change
 
 async function handleAbandonedCheckoutMessage(checkout) {
-  if (!checkout.token) return;
-  const token = checkout.token;
-
   if (
     !checkout.email &&
     !checkout?.phone &&
@@ -151,12 +144,6 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.log(
       "Skipping incomplete checkout for sending message (missing contact info)"
     );
-    return;
-  }
-
-  const processedTokens = loadSet(dataFiles.tokens, "timestamp");
-  if (token in processedTokens) {
-    console.log(token, " token is already processed. Skipping.");
     return;
   }
 
@@ -252,10 +239,6 @@ async function handleAbandonedCheckoutMessage(checkout) {
       "https://backend.aisensy.com/campaign/t1/api/v2",
       payload
     ); // Change
-    saveSet(dataFiles.tokens, processedTokens, checkout.token, "timestamp");
-    setTimeout(() => {
-      loadSet(dataFiles.tokens, "timestamp");
-    }, 1 * 60 * 1000); // Delay for 1 minute for deleting old tokens
     console.log(
       `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
     );
@@ -272,21 +255,8 @@ async function handleAbandonedCheckoutMessage(checkout) {
   }
 }
 
-function isRecentlyMessaged(checkout) {
-  const now = Date.now();
-  const key =
-    checkout.email || checkout.phone || checkout.shipping_address?.phone;
-  if (!key) return false;
-
-  const lastSeen = recentUsers.get(key);
-  if (lastSeen && now - lastSeen < USER_SUPPRESSION_WINDOW) return true;
-
-  recentUsers.set(key, now);
-  return false;
-}
-
 async function createOrderFromPayment(checkout, payment) {
-  if (!checkout || !checkout.token) {
+  if (!checkout) {
     console.log("No checkout token provided. Skipping order creation.");
     return;
   }
@@ -312,6 +282,7 @@ async function createOrderFromPayment(checkout, payment) {
   const getOrdersFromPast = new Date(
     Date.now() - SEND_MESSAGE_DELAY
   ).toISOString();
+
   try {
     const phone = checkout?.shipping_address?.phone || checkout?.phone;
     if (!phone) {
@@ -577,16 +548,15 @@ async function createOrderFromPayment(checkout, payment) {
 }
 
 async function verifyCheckout(checkout) {
-  if (!checkout || !checkout.token) {
+  if (!checkout) {
     console.log("No checkout token provided. Skipping payment fetch.");
     return;
   }
+
   if (!razorpayClient) {
     console.log("Razorpay client not initialized. Skipping payment fetch.");
     return;
   }
-
-  if (!checkout.token) return;
 
   if (
     !checkout?.email &&
@@ -709,68 +679,67 @@ async function verifyCheckout(checkout) {
   }
 }
 
+setInterval(() => {
+  const checkouts = loadSet(dataFiles.checkouts, "debounced");
+  const now = Date.now();
+
+  if (Object.keys(checkouts).length === 0) return; // Skip if no checkouts
+
+  let changed = false;
+
+  for (const [cart_token, data] of Object.entries(checkouts)) {
+    const timeSinceUpdate = now - data.updatedAt;
+
+    if (timeSinceUpdate >= SEND_MESSAGE_DELAY) {
+      const checkout = data.checkout;
+
+      const shipping = checkout.shipping_address || {};
+      const rawPhone = shipping?.phone || checkout.phone || "";
+      const hasValidPhone = rawPhone.replace(/\D/g, "").length >= 10;
+
+      const hasContactInfo =
+        hasValidPhone && (checkout.customer?.first_name || shipping.first_name);
+
+      if (hasContactInfo) {
+        console.log(`[Queue] Sending message for cart_token: ${cart_token}`);
+        verifyCheckout(checkout);
+      } else {
+        console.log(`[Queue] Still missing info for: ${cart_token}`);
+      }
+
+      delete checkouts[cart_token]; // Remove after decision
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    for (const [cart_token, data] of Object.entries(checkouts)) {
+      saveSet(
+        dataFiles.checkouts,
+        checkouts,
+        { cart_token, checkout: data.checkout },
+        "debounced"
+      );
+    }
+  }
+}, CHECK_INTERVAL);
+
 app.post("/webhook/abandoned-checkouts", async (req, res) => {
   res.status(200).send("OK");
 
   const checkout = req.body;
-  const token = checkout?.token;
   const cart_token = checkout?.cart_token;
-  const eventType = req.headers["x-shopify-topic"];
-  if (cart_token) {
-    console.log(`[${eventType}] Processing cart_token: ${cart_token}`);
-  }
 
-  if (!token) {
-    console.log(`[${eventType}] Missing token. Ignored.`);
-    return;
-  }
+  if (!cart_token) return;
 
-  const processedTokens = loadSet(dataFiles.tokens, "timestamp");
-  if (token in processedTokens) {
-    console.log(`[${eventType}] Already processed token: ${token}`);
-    return;
-  }
+  const checkouts = loadSet(dataFiles.checkouts, "debounced");
 
-  const rawPhone = checkout?.shipping_address?.phone || checkout?.phone || "";
-
-  if (rawPhone.replace(/\D/g, "").length < 10) {
-    console.log("Missing contact info. Skipping...");
-    return;
-  }
-
-  const shipping = checkout?.shipping_address || {};
-  const hasContactInfo =
-    (shipping.phone || checkout.phone) &&
-    (checkout.customer?.first_name || shipping.first_name) &&
-    shipping.address1 &&
-    shipping.city &&
-    shipping.province &&
-    shipping.country &&
-    shipping.zip;
-
-  if (hasContactInfo) {
-    console.log(
-      `[${eventType}] Checkout has contact info. Proceeding with message queueing.`
-    );
-  } else {
-    console.log(
-      `[${eventType}] Checkout missing contact info. Skipping message queueing.`
-    );
-    return;
-  }
-
-  if (isRecentlyMessaged(checkout)) {
-    console.log(`[${eventType}] User recently messaged. Skipping...`);
-    return;
-  }
-
-  console.log(
-    `[${eventType}] Queuing new message for cart_token: ${cart_token}`
+  saveSet(
+    dataFiles.checkouts,
+    checkouts,
+    { cart_token, checkout },
+    "debounced"
   );
-
-  setTimeout(() => {
-    verifyCheckout(checkout);
-  }, SEND_MESSAGE_DELAY);
 });
 
 // --- Order Confirmation ---
