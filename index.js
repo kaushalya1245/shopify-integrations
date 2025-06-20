@@ -713,14 +713,7 @@ setInterval(() => {
   }
 
   if (changed) {
-    for (const [cart_token, data] of Object.entries(checkouts)) {
-      saveSet(
-        dataFiles.checkouts,
-        checkouts,
-        { cart_token, checkout: data.checkout },
-        "debounced"
-      );
-    }
+    fs.writeFileSync(dataFiles.checkouts, JSON.stringify(checkouts, null, 2));
   }
 }, CHECK_INTERVAL);
 
