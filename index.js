@@ -30,7 +30,7 @@ app.use(
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
 const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Change
-const MINUTES_FOR_PAYMENT_CHECK = 30; // 30 Minutes delay
+const MINUTES_FOR_PAYMENT_CHECK = 90; // 30 Minutes delay
 let isSending = false;
 const messageQueue = [];
 
@@ -111,6 +111,7 @@ async function processQueue() {
 
 // async function fetchPayments() {
 //   try {
+//     // const todaysPayments = await razorpayClient.fetchYesterdaysPayments();
 //     const todaysPayments = await razorpayClient.fetchTodaysPayments();
 //     if (!todaysPayments || !todaysPayments.items) {
 //       console.log("No payments found for today.");

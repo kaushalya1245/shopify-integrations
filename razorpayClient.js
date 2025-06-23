@@ -46,6 +46,33 @@ class RazorpayClient {
     return await this.instance.payments.all({ from, to, count: 100 });
   }
 
+  async fetchYesterdaysPayments() {
+    const now = new Date();
+
+    // Get yesterday's date
+    const yesterday = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() - 1
+    );
+
+    // Start of yesterday (00:00:00)
+    const from = Math.floor(yesterday.getTime() / 1000);
+
+    // End of yesterday (23:59:59)
+    const endOfYesterday = new Date(
+      yesterday.getFullYear(),
+      yesterday.getMonth(),
+      yesterday.getDate(),
+      23,
+      59,
+      59
+    );
+    const to = Math.floor(endOfYesterday.getTime() / 1000);
+
+    return await this.instance.payments.all({ from, to, count: 100 });
+  }
+
   // Add more wrappers as needed
 }
 
