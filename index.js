@@ -29,7 +29,7 @@ app.use(
 
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
-const SEND_MESSAGE_DELAY = 25 * 60 * 1000; // 25 Minutes delay // Change
+const SEND_MESSAGE_DELAY = 60 * 60 * 1000; // 25 Minutes delay // Change
 const MINUTES_FOR_PAYMENT_CHECK = 90; // 30 Minutes delay
 let isSending = false;
 const messageQueue = [];
@@ -94,7 +94,6 @@ function saveSet(filePath, dataset, item, type = "set") {
 }
 
 // --- Abandoned Checkouts ---
-
 async function processQueue() {
   if (isSending || messageQueue.length === 0) return;
   isSending = true;
@@ -236,14 +235,14 @@ async function handleAbandonedCheckoutMessage(checkout) {
   };
 
   try {
-    const response = await axios.post(
-      "https://backend.aisensy.com/campaign/t1/api/v2",
-      payload
-    ); // Change
-    console.log(
-      `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
-    );
-    console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
+    // const response = await axios.post(
+    //   "https://backend.aisensy.com/campaign/t1/api/v2",
+    //   payload
+    // ); // Change
+    // console.log(
+    //   `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
+    // );
+    // console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
     console.error("Abandoned checkout message error: ", err);
     console.log(
@@ -809,15 +808,15 @@ async function sendOrderConfirmation(order) {
     };
 
     try {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      ); // Change
+      // const response = await axios.post(
+      //   "https://backend.aisensy.com/campaign/t1/api/v2",
+      //   payload
+      // ); // Change
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
-      console.log(
-        `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
-      );
-      console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+      // console.log(
+      //   `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
+      // );
+      // console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error("Order confirmation message error");
       console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
@@ -930,18 +929,18 @@ async function sendFulfillmentMessage(fulfillment) {
     };
 
     try {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      ); // Change
+      // const response = await axios.post(
+      //   "https://backend.aisensy.com/campaign/t1/api/v2",
+      //   payload
+      // ); // Change
       saveSet(
         dataFiles.fulfillments,
         processedFulfillments,
         fulfillment.id.toString(),
         "set"
       );
-      console.log("Fulfillment message sent:", response.data);
-      console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
+      // console.log("Fulfillment message sent:", response.data);
+      // console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error("Fulfillment message error");
       console.log(`Fulfillment message cannot be sent to (${cleanedPhone})`);

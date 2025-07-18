@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node shopify-webhook.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@shopify/shopify-api": "^11.13.0",
