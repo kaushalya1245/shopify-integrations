@@ -1,4 +1,3 @@
-// shopify-webhooks-all-in-one.js
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -11,6 +10,7 @@ const {
 } = require("@shopify/shopify-api");
 const { nodeAdapter } = require("@shopify/shopify-api/adapters/node");
 const { razorpayClient } = require("./razorpayClient");
+const { countries } = require("country-data");
 
 const app = express();
 
@@ -29,12 +29,13 @@ app.use(
 
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
-const SEND_MESSAGE_DELAY = 60 * 60 * 1000; // 25 Minutes delay // Change
-const MINUTES_FOR_PAYMENT_CHECK = 90; // 30 Minutes delay
+const SEND_MESSAGE_DELAY = 60 * 60 * 1000; // Change
+const MINUTES_FOR_PAYMENT_CHECK = 120; // Payment check from 2 hours ago
+const MINUTES_FOR_ORDER_CHECK = 120 * 60 * 1000; // Order check from 2 hours ago
 let isSending = false;
 const messageQueue = [];
+const processingPayments = new Set();
 
-// Shopify setup (shared)
 const shopify = shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
   apiSecretKey: process.env.SHOPIFY_API_SECRET,
@@ -57,12 +58,12 @@ const session = new Session({
 
 const client = new shopify.clients.Rest({ session });
 
-// --- Helpers for persistence ---
 const dataFiles = {
   checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
   payments: path.resolve(__dirname, "processed-payments.json"),
+  locks: path.resolve(__dirname, "in-process-locks.json"),
 };
 
 function loadSet(filePath, type = "set") {
@@ -93,6 +94,40 @@ function saveSet(filePath, dataset, item, type = "set") {
   }
 }
 
+// --- Locks ---
+// Used to prevent multiple processes from handling the same checkout at the same time
+
+function loadLocks() {
+  try {
+    return JSON.parse(fs.readFileSync(dataFiles.locks));
+  } catch {
+    return {};
+  }
+}
+
+function saveLocks(locks) {
+  fs.writeFileSync(dataFiles.locks, JSON.stringify(locks, null, 2));
+}
+
+function isLocked(id) {
+  const locks = loadLocks();
+  return Boolean(locks[id]);
+}
+
+function lockId(id) {
+  const locks = loadLocks();
+  if (locks[id]) return false;
+  locks[id] = Date.now();
+  saveLocks(locks);
+  return true;
+}
+
+function unlockId(id) {
+  const locks = loadLocks();
+  delete locks[id];
+  saveLocks(locks);
+}
+
 // --- Abandoned Checkouts ---
 async function processQueue() {
   if (isSending || messageQueue.length === 0) return;
@@ -108,32 +143,16 @@ async function processQueue() {
   }
 }
 
-// async function fetchPayments() {
-//   try {
-//     // const todaysPayments = await razorpayClient.fetchYesterdaysPayments();
-//     const todaysPayments = await razorpayClient.fetchTodaysPayments();
-//     if (!todaysPayments || !todaysPayments.items) {
-//       console.log("No payments found for today.");
-//       return;
-//     }
-
-//     todaysPayments.items.map((payment) => {
-//       if (payment.status !== "captured") return;
-//       console.log(payment);
-//       if (payment?.notes?.cancelUrl === undefined) return;
-//     });
-
-//     const capturedPayments = todaysPayments.items.filter(
-//       (payment) => payment.status === "captured"
-//     );
-
-//     console.log(capturedPayments.length, "payments found for today.");
-//   } catch (error) {
-//     console.error("Error fetching payments");
-//   }
-// }
-
-// fetchPayments(); // Change
+// Function for getting country calling code based on country code
+function getDialCode(countryCode) {
+  try {
+    const country = countries[countryCode];
+    return country ? `${country.countryCallingCodes[0]}` : "+91";
+  } catch (error) {
+    console.error("Error fetching country calling code");
+    return null;
+  }
+}
 
 async function handleAbandonedCheckoutMessage(checkout) {
   if (
@@ -158,7 +177,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
         [queryField]: queryValue,
         fields: "id, checkout_token, cart_token",
         status: "any",
-        limit: 5,
+        limit: 50,
       },
     });
     orders = res.body.orders;
@@ -177,6 +196,11 @@ async function handleAbandonedCheckoutMessage(checkout) {
   const name = checkout.shipping_address?.first_name || "Customer";
   const amount = checkout.total_price || "0";
   const abandonedCheckoutUrl = `checkouts/cn/${checkout.cart_token}/information`;
+  const countryCode =
+    checkout.shipping_address?.country_code ||
+    checkout.billing_address?.country_code ||
+    checkout.country_code ||
+    "IN";
 
   // Fetch product image
   const variantId = Number(checkout.line_items[0]?.variant_id);
@@ -210,13 +234,16 @@ async function handleAbandonedCheckoutMessage(checkout) {
     console.error("Failed to fetch product images");
   }
 
+  const dialCode = getDialCode(countryCode);
+
   let rawPhone = checkout?.shipping_address?.phone || checkout?.phone || "";
   let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
+  const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
   const payload = {
     apiKey: process.env.AISENSY_API_KEY,
     campaignName: process.env.AC_CAMPAIGN_NAME,
-    destination: cleanedPhone,
+    destination: phoneNumberInternationalFormat,
     userName: name,
     source: "organic",
     templateParams: [name, amount, abandonedCheckoutUrl],
@@ -235,14 +262,14 @@ async function handleAbandonedCheckoutMessage(checkout) {
   };
 
   try {
-    // const response = await axios.post(
-    //   "https://backend.aisensy.com/campaign/t1/api/v2",
-    //   payload
-    // ); // Change
-    // console.log(
-    //   `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
-    // );
-    // console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
+    const response = await axios.post(
+      "https://backend.aisensy.com/campaign/t1/api/v2",
+      payload
+    );
+    console.log(
+      `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
+    );
+    console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
     console.error("Abandoned checkout message error: ", err);
     console.log(
@@ -265,22 +292,32 @@ async function createOrderFromPayment(checkout, payment) {
     return;
   }
 
+  const countryCode =
+    checkout.shipping_address?.country_code ||
+    checkout.billing_address?.country_code ||
+    checkout.country_code ||
+    "IN";
+
   const rawPhone =
     checkout.phone ||
     checkout.shipping_address?.phone ||
     checkout.billing_address?.phone ||
     "";
 
-  const sanitizedPhone = rawPhone.replace(/\D/g, ""); // remove all non-digits
+  const sanitizedPhone = rawPhone.replace(/\D/g, "");
 
-  // Prefix country code if missing
+  const dialCode = getDialCode(countryCode);
+  const phoneNumberInternationalFormat = dialCode
+    ? `${dialCode}${sanitizedPhone}`
+    : `+91${sanitizedPhone}`;
+
   const formattedPhone =
     sanitizedPhone.length === 10
-      ? `+91${sanitizedPhone}`
+      ? `${phoneNumberInternationalFormat}`
       : `+${sanitizedPhone}`;
 
   const getOrdersFromPast = new Date(
-    Date.now() - SEND_MESSAGE_DELAY
+    Date.now() - MINUTES_FOR_ORDER_CHECK
   ).toISOString();
 
   try {
@@ -298,7 +335,7 @@ async function createOrderFromPayment(checkout, payment) {
         [queryField]: queryValue,
         created_at_min: getOrdersFromPast,
         status: "any",
-        limit: 5,
+        limit: 50,
       },
     });
 
@@ -310,7 +347,7 @@ async function createOrderFromPayment(checkout, payment) {
 
       if (matchingOrder) {
         console.log("✅ Matching recent order found. Skipping order creation.");
-        return;
+        return; // Change
       }
     }
 
@@ -354,7 +391,7 @@ async function createOrderFromPayment(checkout, payment) {
         checkout.billing_address?.last_name ||
         "",
       email: checkout.email,
-      phone: formattedPhone, // Make sure this is validated
+      phone: formattedPhone,
     };
   }
 
@@ -436,12 +473,11 @@ async function createOrderFromPayment(checkout, payment) {
         },
       ],
 
-      note: `Auto-created after Razorpay capture (${payment.id})`,
+      note: `Auto-created after Razorpay capture (${payment.id}) | cart_token: ${checkout.cart_token} | checkout_token: ${checkout.token}`,
       tags: "ManualOrder, RazorpayPaid",
     },
   };
 
-  // Step 3: Create the order
   try {
     const orderResponse = await client.post({
       path: "orders",
@@ -582,7 +618,7 @@ async function verifyCheckout(checkout) {
         [queryField]: queryValue,
         fields: "id, checkout_token, cart_token",
         status: "any",
-        limit: 5,
+        limit: 50,
       },
     });
     orders = res.body.orders;
@@ -624,31 +660,43 @@ async function verifyCheckout(checkout) {
     if (!todaysPayments || !todaysPayments.items) {
       console.log("No payments found for today.");
     } else {
-      const capturedPayments = todaysPayments.items.find((payment) => {
-        if (payment.status !== "captured") return;
-        if (payment?.notes?.cancelUrl === undefined) return;
-        const perfectPhoneDigits = payment?.contact
-          .replace(/\s+/g, "")
-          .slice(-10);
-        const perfectAmount = payment?.amount / 100;
-        const totalCheckoutPrice = Number(checkout.total_price);
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const thirtyMinutesAgo =
-          currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
-        if (
-          ((perfectPhoneDigits === checkout?.shipping_address?.phone &&
-            perfectAmount == totalCheckoutPrice) ||
-            (payment?.contact === checkout?.phone &&
-              perfectAmount == totalCheckoutPrice) ||
-            payment?.notes?.cancelUrl.indexOf(checkout?.cart_token) !== -1) &&
-          payment.created_at >= thirtyMinutesAgo &&
-          payment.created_at <= currentTimestamp
-        ) {
-          return payment;
-        }
-      });
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      const twoHoursAgo = currentTimestamp - MINUTES_FOR_PAYMENT_CHECK * 60;
+      const totalCheckoutPrice = Number(checkout.total_price);
 
-      if (!capturedPayments) {
+      const matchingPayments = todaysPayments.items
+        .filter((payment) => {
+          if (payment.status !== "captured") return false;
+          if (!payment?.notes?.cancelUrl) return false;
+
+          const perfectPhoneDigits = payment?.contact
+            .replace(/\s+/g, "")
+            .slice(-10);
+          const perfectAmount = payment.amount / 100;
+
+          const matchesPhoneAndAmount =
+            (perfectPhoneDigits === checkout?.shipping_address?.phone &&
+              perfectAmount === totalCheckoutPrice) ||
+            (payment.contact === checkout?.phone &&
+              perfectAmount === totalCheckoutPrice);
+
+          const matchesCartToken = payment.notes.cancelUrl.includes(
+            checkout?.cart_token
+          );
+
+          const isWithinTimeRange =
+            payment.created_at >= twoHoursAgo &&
+            payment.created_at <= currentTimestamp;
+
+          return (
+            (matchesPhoneAndAmount || matchesCartToken) && isWithinTimeRange
+          );
+        })
+        .sort((a, b) => b.created_at - a.created_at);
+
+      const capturedPayment = matchingPayments[0];
+
+      if (!capturedPayment) {
         console.log(
           `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`
         );
@@ -657,22 +705,41 @@ async function verifyCheckout(checkout) {
         return;
       }
 
-      if (processedPayments.has(capturedPayments.id)) {
+      if (processingPayments.has(capturedPayment.id)) {
         console.log(
-          `Payment ${capturedPayments.id} already processed. Skipping.`
+          `⚠️ Payment ${capturedPayment.id} is being processed. Skipping.`
         );
         return;
       }
 
-      console.log(
-        `Captured payment found for checkout ${checkout.cart_token}:`,
-        capturedPayments.contact,
-        capturedPayments.id,
-        new Date(capturedPayments.created_at * 1000).toLocaleString()
-      );
+      if (!lockId(capturedPayment.id)) {
+        console.log(`Payment ${capturedPayment.id} is locked persistently.`);
+        return;
+      }
 
-      saveSet(dataFiles.payments, processedPayments, capturedPayments.id);
-      await createOrderFromPayment(checkout, capturedPayments);
+      processingPayments.add(capturedPayment.id);
+
+      try {
+        if (processedPayments.has(capturedPayment.id)) {
+          console.log(
+            `Payment ${capturedPayment.id} already processed. Skipping.`
+          );
+          return;
+        }
+
+        console.log(
+          `Captured payment found for checkout ${checkout.cart_token}:`,
+          capturedPayment.contact,
+          capturedPayment.id,
+          new Date(capturedPayment.created_at * 1000).toLocaleString()
+        );
+
+        await createOrderFromPayment(checkout, capturedPayment);
+        saveSet(dataFiles.payments, processedPayments, capturedPayment.id);
+      } finally {
+        processingPayments.delete(capturedPayment.id);
+        unlockId(capturedPayment.id);
+      }
     }
   } catch (error) {
     console.error("Error fetching payments");
@@ -683,7 +750,7 @@ setInterval(() => {
   const checkouts = loadSet(dataFiles.checkouts, "debounced");
   const now = Date.now();
 
-  if (Object.keys(checkouts).length === 0) return; // Skip if no checkouts
+  if (Object.keys(checkouts).length === 0) return;
 
   let changed = false;
 
@@ -701,13 +768,13 @@ setInterval(() => {
         hasValidPhone && (checkout.customer?.first_name || shipping.first_name);
 
       if (hasContactInfo) {
-        console.log(`[Queue] Sending message for cart_token: ${cart_token}`);
+        console.log(`Processing cart_token: ${cart_token}`);
         verifyCheckout(checkout);
       } else {
-        console.log(`[Queue] Still missing info for: ${cart_token}`);
+        console.log(`Still missing info for: ${cart_token}`);
       }
 
-      delete checkouts[cart_token]; // Remove after decision
+      delete checkouts[cart_token];
       changed = true;
     }
   }
@@ -736,6 +803,141 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 });
 
 // --- Order Confirmation ---
+const restockInventoryFromOrder = async (orderId) => {
+  try {
+    // 1. Fetch the order to get line_items
+    const orderRes = await client.get({
+      path: `orders/${orderId}.json`,
+    });
+    const order = orderRes.body.order;
+    const lineItems = order.line_items;
+
+    const locationRes = await client.get({ path: "locations" });
+    const locationId = locationRes.body.locations[0].id;
+    if (!locationId) {
+      console.error("No location ID found. Cannot adjust inventory.");
+      return;
+    }
+
+    const headers = {
+      headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+    };
+
+    if (!lineItems.length) {
+      console.log("No line items found to restock.");
+      return;
+    }
+
+    // 3. Loop through each item and restock
+    for (const item of lineItems) {
+      const variantId = item.variant_id;
+      const quantityToRestock = item.quantity;
+
+      // Get inventory_item_id for the variant
+      const variantRes = await axios.get(
+        `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
+        headers
+      );
+
+      if (!variantRes.data || !variantRes.data.variant) {
+        console.log(`No variant found for ID ${variantId}`);
+        return;
+      }
+
+      console.log(`Processing variant ${variantId} for inventory adjustment`);
+      if (!variantRes.data.variant.inventory_item_id) {
+        console.log(`Variant ${variantId} has no inventory item ID`);
+        return;
+      }
+
+      const inventoryItemId = variantRes.data.variant.inventory_item_id;
+      if (!inventoryItemId) {
+        console.log("No inventory item ID found for variant:", variantId);
+        return;
+      }
+      console.log(
+        `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`
+      );
+      // Restock the inventory
+      const inventoryResponse = await client.post({
+        path: `inventory_levels/adjust.json`,
+        data: {
+          location_id: locationId,
+          inventory_item_id: inventoryItemId,
+          available_adjustment: quantityToRestock,
+        },
+        type: "application/json",
+      });
+
+      console.log(
+        `Restocked ${quantityToRestock} units for variant ${variantId}`
+      );
+    }
+
+    console.log(`✅ Inventory restocked successfully for order ${orderId}`);
+  } catch (error) {
+    console.error(
+      "❌ Error restocking inventory:",
+      error.response?.data || error.message
+    );
+  }
+};
+
+const cancelOrder = async (orderId) => {
+  try {
+    restockInventoryFromOrder(orderId).then(async () => {
+      const cancelResponse = await client.post({
+        path: `orders/${orderId}/cancel.json`,
+        data: {
+          email: false,
+        },
+        type: "application/json",
+      });
+
+      console.log(`✅ Order ${orderId} cancelled successfully`);
+      return cancelResponse.body;
+    });
+  } catch (error) {
+    console.error(
+      "❌ Error cancelling order:",
+      error.response?.data || error.message
+    );
+  }
+};
+
+async function processOrder(order) {
+  const phone =
+    order?.phone ||
+    order.billing_address?.phone ||
+    order.customer.default_address?.phone;
+  const queryField = order.email || order.customer?.email ? "email" : "phone";
+  const queryValue = order.email || phone;
+
+  const res = await client.get({
+    path: "orders",
+    query: {
+      [queryField]: queryValue,
+      fields: "id, note",
+      status: "any",
+      limit: 50,
+    },
+  });
+  const orders = res.body.orders;
+  if (orders || orders.length > 0) {
+    const matchingOrder = orders.find(
+      (o) =>
+        o.note &&
+        (o.note.indexOf(order.cart_token) !== -1 ||
+          o.note.indexOf(order.checkout_token) !== -1)
+    );
+    if (matchingOrder) {
+      cancelOrder(order.id);
+      return;
+    }
+  }
+  sendOrderConfirmation(order);
+}
+
 const processedOrders = loadSet(dataFiles.orders, "set");
 
 async function sendOrderConfirmation(order) {
@@ -747,10 +949,17 @@ async function sendOrderConfirmation(order) {
     const orderName = order.name.replace("#", "") || "Unknown Order";
     const amount = order.total_price || "0";
 
+    const countryCode =
+      order.shipping_address?.country_code ||
+      order.billing_address?.country_code ||
+      "IN";
+
+    const dialCode = getDialCode(countryCode);
+
     let rawPhone = shippingAddress.phone || customer.phone || "";
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
+    const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
-    // Fetch product image
     let imageUrl =
       "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
     if (order.line_items?.length) {
@@ -789,7 +998,7 @@ async function sendOrderConfirmation(order) {
     const payload = {
       apiKey: process.env.AISENSY_API_KEY,
       campaignName: process.env.OC_CAMPAIGN_NAME,
-      destination: cleanedPhone,
+      destination: phoneNumberInternationalFormat,
       userName: name,
       source: "organic",
       templateParams: [name, orderName, `₹${amount}`, orderStatusURL],
@@ -808,15 +1017,13 @@ async function sendOrderConfirmation(order) {
     };
 
     try {
-      // const response = await axios.post(
-      //   "https://backend.aisensy.com/campaign/t1/api/v2",
-      //   payload
-      // ); // Change
+      const response = await axios.post(
+        "https://backend.aisensy.com/campaign/t1/api/v2",
+        payload
+      );
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
-      // console.log(
-      //   `Order confirmation message sent for ${order.cart_token}. Response: ${response.data}`
-      // );
-      // console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+      console.log(`Order confirmation message sent for ${order.cart_token}`);
+      console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error("Order confirmation message error");
       console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
@@ -839,7 +1046,7 @@ app.post("/webhook/order-confirmation", (req, res) => {
     return;
   }
 
-  sendOrderConfirmation(order);
+  processOrder(order);
 });
 
 // --- Fulfillment Creation ---
@@ -864,8 +1071,13 @@ async function sendFulfillmentMessage(fulfillment) {
       console.log(`Processing fulfillment for order ${orderName} (${orderId})`);
     }
 
+    const countryCode = fulfillment.destination?.country_code || "IN"; // Default to India if not found
+
+    const dialCode = getDialCode(countryCode);
+
     let rawPhone = customer.phone || "";
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
+    const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
     const fulfillmentStatusURL = fulfillment.tracking_url;
 
@@ -900,7 +1112,7 @@ async function sendFulfillmentMessage(fulfillment) {
     const payload = {
       apiKey: process.env.AISENSY_API_KEY,
       campaignName: process.env.OST_CAMPAIGN_NAME,
-      destination: cleanedPhone,
+      destination: phoneNumberInternationalFormat,
       userName: name,
       source: "fulfillment",
       templateParams: [
@@ -929,21 +1141,21 @@ async function sendFulfillmentMessage(fulfillment) {
     };
 
     try {
-      // const response = await axios.post(
-      //   "https://backend.aisensy.com/campaign/t1/api/v2",
-      //   payload
-      // ); // Change
+      const response = await axios.post(
+        "https://backend.aisensy.com/campaign/t1/api/v2",
+        payload
+      );
       saveSet(
         dataFiles.fulfillments,
         processedFulfillments,
         fulfillment.id.toString(),
         "set"
       );
-      // console.log("Fulfillment message sent:", response.data);
-      // console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
+      console.log("Fulfillment message sent:", response.data);
+      console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error("Fulfillment message error");
-      console.log(`Fulfillment message cannot be sent to (${cleanedPhone})`);
+      console.log(`Fulfillment message cannot be sent`);
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
