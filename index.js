@@ -66,6 +66,33 @@ const dataFiles = {
   locks: path.resolve(__dirname, "in-process-locks.json"),
 };
 
+// async function getOrders(phoneNumber) {
+//   const res = await client.get({
+//     path: "orders",
+//     query: {
+//       fields: "id, checkout_token, cart_token, email, phone, total_price",
+//       status: "any",
+//       limit: 250,
+//     },
+//   });
+
+//   const orders = res.body.orders;
+//   orders.find((order) => {
+//     if (
+//       (order.phone &&
+//         order.phone.indexOf(0) !== -1 &&
+//         order.total_price == "0") ||
+//       (order.email &&
+//         order.email.indexOf(null) !== -1 &&
+//         order.total_price == "8,502.00")
+//     ) {
+//       console.log(order);
+//     }
+//   });
+// }
+
+// getOrders("8921336443");
+
 function loadSet(filePath, type = "set") {
   try {
     const data = JSON.parse(fs.readFileSync(filePath));
@@ -925,16 +952,14 @@ async function processOrder(order) {
   const orders = res.body.orders;
   if (orders || orders.length > 0) {
     const matchingOrder = orders.find(
-      (o) =>
-        o.note &&
-        (o.note.indexOf(order.cart_token) !== -1 ||
-          o.note.indexOf(order.checkout_token) !== -1)
+      (o) => o.note && o.note.indexOf(order.checkout_token) !== -1
     );
     if (matchingOrder) {
       cancelOrder(order.id);
       return;
     }
   }
+  sendLowStockNotification(order);
   sendOrderConfirmation(order);
 }
 
@@ -1034,6 +1059,136 @@ async function sendOrderConfirmation(order) {
     }
   } catch (err) {
     console.error("Order confirmation error");
+  }
+}
+
+async function sendLowStockNotification(order) {
+  const orderId = order.id;
+  try {
+    // 1. Fetch the order to get line_items
+    const orderRes = await client.get({
+      path: `orders/${orderId}.json`,
+    });
+
+    const order = orderRes.body.order;
+    const lineItems = order.line_items;
+
+    const locationRes = await client.get({ path: "locations" });
+
+    const locationId = locationRes.body.locations[0].id;
+    if (!locationId) {
+      console.error("No location ID found. Cannot adjust inventory.");
+      return;
+    }
+
+    const headers = {
+      headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+    };
+
+    if (!lineItems.length) {
+      console.log("No line items found to restock.");
+      return;
+    }
+
+    // 3. Loop through each item and restock
+    for (const item of lineItems) {
+      const productId = item.product_id;
+      const variantId = item.variant_id;
+
+      // Get inventory_item_id for the variant
+      const productRes = await axios.get(
+        `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}.json`,
+        headers
+      );
+
+      // Get inventory_item_id for the variant
+      const variantRes = await axios.get(
+        `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
+        headers
+      );
+
+      if (!variantRes.data || !variantRes.data.variant) {
+        console.log(`No variant found for ID ${variantId}`);
+        return;
+      }
+
+      const productTitle = productRes.data.product.title;
+      const productOption = variantRes.data.variant.option1;
+      const currentStock = variantRes.data.variant.inventory_quantity;
+
+      const thresholdQuantity = 4; // Set your low stock threshold
+      let imageUrl =
+        "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+
+      try {
+        const productImagesRes = await axios.get(
+          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
+          headers
+        );
+
+        if (productImagesRes?.data?.images?.length > 0) {
+          const variantImage = productImagesRes?.data?.images.find((img) =>
+            img.variant_ids.includes(variantId)
+          );
+          imageUrl = (
+            variantImage || productImagesRes?.data?.images[0]
+          ).src.split("?")[0];
+        }
+      } catch (imageError) {
+        console.error("Failed to fetch product image");
+      }
+      const viewInventoryUrl = `admin/products/${productId}?variant=${variantId}`;
+
+      if (currentStock <= thresholdQuantity) {
+        const payload = {
+          apiKey: process.env.AISENSY_API_KEY,
+          campaignName: process.env.LSA_CAMPAIGN_NAME,
+          destination: "+917715878352",
+          userName: "Admin",
+          source: "low_stock",
+          templateParams: [
+            productTitle.toString(),
+            productOption.toString() || "Default Variant",
+            currentStock.toString(),
+            thresholdQuantity.toString(),
+            viewInventoryUrl.toString(),
+          ],
+          media: {
+            url: imageUrl,
+            filename: "product.jpg",
+          },
+          buttons: [
+            {
+              type: "button",
+              sub_type: "url",
+              index: "0",
+              parameters: [{ type: "text", text: viewInventoryUrl }],
+            },
+          ],
+        };
+
+        try {
+          const response = await axios.post(
+            "https://backend.aisensy.com/campaign/t1/api/v2",
+            payload
+          );
+          console.log(
+            `Low stock alert sent for ${productTitle} (${productOption})`
+          );
+        } catch (err) {
+          console.error("Low stock alert message error");
+          if (err.response) {
+            console.error("Response data: ", err.response.data);
+            console.error("Response status: ", err.response.status);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error(
+      "❌ Error sending low stock alert: ",
+      error.response?.data || error.message
+    );
   }
 }
 
