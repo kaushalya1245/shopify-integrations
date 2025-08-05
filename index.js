@@ -11,6 +11,7 @@ const {
 const { nodeAdapter } = require("@shopify/shopify-api/adapters/node");
 const { razorpayClient } = require("./razorpayClient");
 const { countries } = require("country-data");
+const cheerio = require("cheerio");
 
 const app = express();
 
@@ -1113,6 +1114,10 @@ async function sendLowStockNotification(order) {
       }
 
       const productTitle = productRes.data.product.title;
+      let productCode = productRes.data.product.body_html || "";
+      const $ = cheerio.load(productCode);
+      productCode = $("p").text().trim() || "No code available";
+
       const productOption = variantRes.data.variant.option1;
       const currentStock = variantRes.data.variant.inventory_quantity;
 
@@ -1148,6 +1153,7 @@ async function sendLowStockNotification(order) {
           source: "low_stock",
           templateParams: [
             productTitle.toString(),
+            productCode.toString(),
             productOption.toString() || "Default Variant",
             currentStock.toString(),
             thresholdQuantity.toString(),
