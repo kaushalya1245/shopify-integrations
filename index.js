@@ -1144,7 +1144,7 @@ async function sendLowStockNotification(order) {
       }
       const viewInventoryUrl = `admin/products/${productId}?variant=${variantId}`;
 
-      if (currentStock <= thresholdQuantity) {
+      if (currentStock < thresholdQuantity) {
         const payload = {
           apiKey: process.env.AISENSY_API_KEY,
           campaignName: process.env.LSA_CAMPAIGN_NAME,
