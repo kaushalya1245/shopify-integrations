@@ -831,138 +831,136 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 });
 
 // --- Order Confirmation ---
-const restockInventoryFromOrder = async (orderId) => {
-  try {
-    // 1. Fetch the order to get line_items
-    const orderRes = await client.get({
-      path: `orders/${orderId}.json`,
-    });
-    const order = orderRes.body.order;
-    const lineItems = order.line_items;
+// const restockInventoryFromOrder = async (orderId) => {
+//   try {
+//     // 1. Fetch the order to get line_items
+//     const orderRes = await client.get({
+//       path: `orders/${orderId}.json`,
+//     });
+//     const order = orderRes.body.order;
+//     const lineItems = order.line_items;
 
-    const locationRes = await client.get({ path: "locations" });
-    const locationId = locationRes.body.locations[0].id;
-    if (!locationId) {
-      console.error("No location ID found. Cannot adjust inventory.");
-      return;
-    }
+//     const locationRes = await client.get({ path: "locations" });
+//     const locationId = locationRes.body.locations[0].id;
+//     if (!locationId) {
+//       console.error("No location ID found. Cannot adjust inventory.");
+//       return;
+//     }
 
-    const headers = {
-      headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
-    };
+//     const headers = {
+//       headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+//     };
 
-    if (!lineItems.length) {
-      console.log("No line items found to restock.");
-      return;
-    }
+//     if (!lineItems.length) {
+//       console.log("No line items found to restock.");
+//       return;
+//     }
 
-    // 3. Loop through each item and restock
-    for (const item of lineItems) {
-      const variantId = item.variant_id;
-      const quantityToRestock = item.quantity;
+//     // 3. Loop through each item and restock
+//     for (const item of lineItems) {
+//       const variantId = item.variant_id;
+//       const quantityToRestock = item.quantity;
 
-      // Get inventory_item_id for the variant
-      const variantRes = await axios.get(
-        `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
-        headers
-      );
+//       // Get inventory_item_id for the variant
+//       const variantRes = await axios.get(
+//         `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
+//         headers
+//       );
 
-      if (!variantRes.data || !variantRes.data.variant) {
-        console.log(`No variant found for ID ${variantId}`);
-        return;
-      }
+//       if (!variantRes.data || !variantRes.data.variant) {
+//         console.log(`No variant found for ID ${variantId}`);
+//         return;
+//       }
 
-      console.log(`Processing variant ${variantId} for inventory adjustment`);
-      if (!variantRes.data.variant.inventory_item_id) {
-        console.log(`Variant ${variantId} has no inventory item ID`);
-        return;
-      }
+//       console.log(`Processing variant ${variantId} for inventory adjustment`);
+//       if (!variantRes.data.variant.inventory_item_id) {
+//         console.log(`Variant ${variantId} has no inventory item ID`);
+//         return;
+//       }
 
-      const inventoryItemId = variantRes.data.variant.inventory_item_id;
-      if (!inventoryItemId) {
-        console.log("No inventory item ID found for variant:", variantId);
-        return;
-      }
-      console.log(
-        `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`
-      );
-      // Restock the inventory
-      const inventoryResponse = await client.post({
-        path: `inventory_levels/adjust.json`,
-        data: {
-          location_id: locationId,
-          inventory_item_id: inventoryItemId,
-          available_adjustment: quantityToRestock,
-        },
-        type: "application/json",
-      });
+//       const inventoryItemId = variantRes.data.variant.inventory_item_id;
+//       if (!inventoryItemId) {
+//         console.log("No inventory item ID found for variant:", variantId);
+//         return;
+//       }
+//       console.log(
+//         `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`
+//       );
+//       // Restock the inventory
+//       const inventoryResponse = await client.post({
+//         path: `inventory_levels/adjust.json`,
+//         data: {
+//           location_id: locationId,
+//           inventory_item_id: inventoryItemId,
+//           available_adjustment: quantityToRestock,
+//         },
+//         type: "application/json",
+//       });
 
-      console.log(
-        `Restocked ${quantityToRestock} units for variant ${variantId}`
-      );
-    }
+//       console.log(
+//         `Restocked ${quantityToRestock} units for variant ${variantId}`
+//       );
+//     }
 
-    console.log(`✅ Inventory restocked successfully for order ${orderId}`);
-  } catch (error) {
-    console.error(
-      "❌ Error restocking inventory:",
-      error.response?.data || error.message
-    );
-  }
-};
+//     console.log(`✅ Inventory restocked successfully for order ${orderId}`);
+//   } catch (error) {
+//     console.error(
+//       "❌ Error restocking inventory:",
+//       error.response?.data || error.message
+//     );
+//   }
+// };
 
-const cancelOrder = async (orderId) => {
-  try {
-    restockInventoryFromOrder(orderId).then(async () => {
-      const cancelResponse = await client.post({
-        path: `orders/${orderId}/cancel.json`,
-        data: {
-          email: false,
-        },
-        type: "application/json",
-      });
+// const cancelOrder = async (orderId) => {
+//   try {
+//     restockInventoryFromOrder(orderId).then(async () => {
+//       const cancelResponse = await client.post({
+//         path: `orders/${orderId}/cancel.json`,
+//         data: {
+//           email: false,
+//         },
+//         type: "application/json",
+//       });
 
-      console.log(`✅ Order ${orderId} cancelled successfully`);
-      return cancelResponse.body;
-    });
-  } catch (error) {
-    console.error(
-      "❌ Error cancelling order:",
-      error.response?.data || error.message
-    );
-  }
-};
+//       console.log(`✅ Order ${orderId} cancelled successfully`);
+//       return cancelResponse.body;
+//     });
+//   } catch (error) {
+//     console.error(
+//       "❌ Error cancelling order:",
+//       error.response?.data || error.message
+//     );
+//   }
+// };
 
-async function processOrder(order) {
-  const phone =
-    order?.phone ||
-    order.billing_address?.phone ||
-    order.customer.default_address?.phone;
-  const queryField = order.email || order.customer?.email ? "email" : "phone";
-  const queryValue = order.email || phone;
+// async function processOrder(order) {
+//   const phone =
+//     order?.phone ||
+//     order.billing_address?.phone ||
+//     order.customer.default_address?.phone;
+//   const queryField = order.email || order.customer?.email ? "email" : "phone";
+//   const queryValue = order.email || phone;
 
-  const res = await client.get({
-    path: "orders",
-    query: {
-      [queryField]: queryValue,
-      fields: "id, note",
-      status: "any",
-      limit: 50,
-    },
-  });
-  const orders = res.body.orders;
-  if (orders || orders.length > 0) {
-    const matchingOrder = orders.find(
-      (o) => o.note && o.note.indexOf(order.checkout_token) !== -1
-    );
-    if (matchingOrder) {
-      cancelOrder(order.id);
-      return;
-    }
-  }
-  sendLowStockNotification(order);
-  sendOrderConfirmation(order);
-}
+//   const res = await client.get({
+//     path: "orders",
+//     query: {
+//       [queryField]: queryValue,
+//       fields: "id, note",
+//       status: "any",
+//       limit: 50,
+//     },
+//   });
+//   const orders = res.body.orders;
+//   if (orders || orders.length > 0) {
+//     const matchingOrder = orders.find(
+//       (o) => o.note && o.note.indexOf(order.checkout_token) !== -1
+//     );
+//     if (matchingOrder) {
+//       cancelOrder(order.id);
+//       return;
+//     }
+//   }
+// }
 
 const processedOrders = loadSet(dataFiles.orders, "set");
 
@@ -1149,6 +1147,7 @@ async function sendLowStockNotification(order) {
           apiKey: process.env.AISENSY_API_KEY,
           campaignName: process.env.LSA_CAMPAIGN_NAME,
           destination: "+917715878352",
+          // destination: "+919309950513",
           userName: "Admin",
           source: "low_stock",
           templateParams: [
@@ -1207,7 +1206,9 @@ app.post("/webhook/order-confirmation", (req, res) => {
     return;
   }
 
-  processOrder(order);
+  // processOrder(order);
+  sendLowStockNotification(order);
+  sendOrderConfirmation(order);
 });
 
 // --- Fulfillment Creation ---
