@@ -789,11 +789,13 @@ setInterval(() => {
       const checkout = data.checkout;
 
       const shipping = checkout.shipping_address || {};
+      const email = checkout.email || "";
       const rawPhone = shipping?.phone || checkout.phone || "";
       const hasValidPhone = rawPhone.replace(/\D/g, "").length >= 10;
 
       const hasContactInfo =
-        hasValidPhone && (checkout.customer?.first_name || shipping.first_name);
+        (hasValidPhone || email) &&
+        (checkout.customer?.first_name || shipping.first_name);
 
       if (hasContactInfo) {
         console.log(`Processing cart_token: ${cart_token}`);
