@@ -1,10 +1,9 @@
 /node_modules
 .env
+# Ignore specific JSON files
 debounced-checkouts.json
 in-process-locks.json
-processed-fulfillments.json
-processed-orders.json
-processed-payments.json
-processed-tokens.json
 logs.json
-razorpayClient.js
+
+# Ignore all processed-*.json files
+processed-*.json

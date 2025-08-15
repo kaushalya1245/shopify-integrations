@@ -67,6 +67,23 @@ const dataFiles = {
   locks: path.resolve(__dirname, "in-process-locks.json"),
 };
 
+// async function getPayments() {
+//   const todaysPayments = await razorpayClient.fetchTodaysPayments();
+//   if (!todaysPayments || !todaysPayments.items) {
+//     console.log("No payments found for today.");
+//   } else {
+//     const matchingPayments = todaysPayments.items.map((payment) => {
+//       if (payment.status !== "captured") return;
+//       if (!payment?.notes?.cancelUrl) return;
+//       return (payment.amount / 100);
+//     });
+//     console.log(matchingPayments);
+//     console.log(matchingPayments.length);
+//   }
+// }
+
+// getPayments();
+
 // async function getOrders(phoneNumber) {
 //   const res = await client.get({
 //     path: "orders",
@@ -350,10 +367,6 @@ async function createOrderFromPayment(checkout, payment) {
 
   try {
     const phone = checkout?.shipping_address?.phone || checkout?.phone;
-    if (!phone) {
-      console.log("No contact info available for checkout. Skipping.");
-      return;
-    }
     const queryField = checkout.email ? "email" : "phone";
     const queryValue = checkout.email || phone;
     const targetPrice = parseFloat(checkout.total_price || "0");
@@ -634,10 +647,6 @@ async function verifyCheckout(checkout) {
   let orders = [];
   try {
     const phone = checkout?.shipping_address?.phone || checkout?.phone;
-    if (!phone) {
-      console.log("No contact info available for checkout. Skipping.");
-      return;
-    }
     const queryField = checkout.email ? "email" : "phone";
     const queryValue = checkout.email || phone;
     const res = await client.get({
@@ -794,8 +803,7 @@ setInterval(() => {
       const hasValidPhone = rawPhone.replace(/\D/g, "").length >= 10;
 
       const hasContactInfo =
-        (hasValidPhone || email) &&
-        (checkout.customer?.first_name || shipping.first_name);
+        (hasValidPhone || email);
 
       if (hasContactInfo) {
         console.log(`Processing cart_token: ${cart_token}`);
