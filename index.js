@@ -68,18 +68,29 @@ const dataFiles = {
 };
 
 // async function getPayments() {
-//   const todaysPayments = await razorpayClient.fetchTodaysPayments();
-//   if (!todaysPayments || !todaysPayments.items) {
-//     console.log("No payments found for today.");
-//   } else {
-//     const matchingPayments = todaysPayments.items.map((payment) => {
-//       if (payment.status !== "captured") return;
-//       if (!payment?.notes?.cancelUrl) return;
-//       return (payment.amount / 100);
-//     });
-//     console.log(matchingPayments);
-//     console.log(matchingPayments.length);
-//   }
+// const todaysPayments = await razorpayClient.fetchTodaysPayments();
+// if (!todaysPayments || !todaysPayments.items) {
+//   console.log("No payments found for today.");
+// } else {
+//   const matchingPayments = todaysPayments.items.map((payment) => {
+//     if (payment.status !== "captured") return;
+//     if (!payment?.notes?.cancelUrl) return;
+//     return (payment.amount / 100);
+//   });
+//   console.log(matchingPayments);
+//   console.log(matchingPayments.length);
+// }
+
+// const res = await client.get({
+//   path: "orders",
+//   query: {
+//     email: "shreya.sppratik@gmail.com",
+//     status: "any",
+//     limit: 10,
+//   },
+// });
+// const orders = res.body.orders;
+// console.log(orders);
 // }
 
 // getPayments();
@@ -211,33 +222,6 @@ async function handleAbandonedCheckoutMessage(checkout) {
     return;
   }
 
-  let orders = [];
-  try {
-    const phone = checkout?.shipping_address?.phone || checkout?.phone;
-    const queryField = checkout.email ? "email" : "phone";
-    const queryValue = checkout.email || phone;
-    const res = await client.get({
-      path: "orders",
-      query: {
-        [queryField]: queryValue,
-        fields: "id, checkout_token, cart_token",
-        status: "any",
-        limit: 50,
-      },
-    });
-    orders = res.body.orders;
-
-    const isOrderNotAbandoned = orders.find(
-      (o) => o.cart_token === checkout.cart_token
-    );
-    if (isOrderNotAbandoned) return;
-
-    const isConverted = orders.find((o) => o.checkout_token === checkout.token);
-    if (isConverted) return;
-  } catch (err) {
-    console.error("Failed to fetch orders");
-  }
-
   const name = checkout.shipping_address?.first_name || "Customer";
   const amount = checkout.total_price || "0";
   const abandonedCheckoutUrl = `checkouts/cn/${checkout.cart_token}/information`;
@@ -360,43 +344,6 @@ async function createOrderFromPayment(checkout, payment) {
     sanitizedPhone.length === 10
       ? `${phoneNumberInternationalFormat}`
       : `+${sanitizedPhone}`;
-
-  const getOrdersFromPast = new Date(
-    Date.now() - MINUTES_FOR_ORDER_CHECK
-  ).toISOString();
-
-  try {
-    const phone = checkout?.shipping_address?.phone || checkout?.phone;
-    const queryField = checkout.email ? "email" : "phone";
-    const queryValue = checkout.email || phone;
-    const targetPrice = parseFloat(checkout.total_price || "0");
-    const res = await client.get({
-      path: "orders",
-      query: {
-        [queryField]: queryValue,
-        created_at_min: getOrdersFromPast,
-        status: "any",
-        limit: 50,
-      },
-    });
-
-    if (res.body.orders.length > 0) {
-      const matchingOrder = res.body.orders.find((item) => {
-        const orderPrice = parseFloat(item.total_price || "0");
-        return orderPrice === targetPrice;
-      });
-
-      if (matchingOrder) {
-        console.log("✅ Matching recent order found. Skipping order creation.");
-        return; // Change
-      }
-    }
-
-    console.log("ℹ️ No matching orders found. Proceeding with order creation.");
-  } catch (error) {
-    console.error("Error fetching customer by phone:", error);
-    return;
-  }
 
   let customerId = null;
   try {
@@ -647,13 +594,10 @@ async function verifyCheckout(checkout) {
   let orders = [];
   try {
     const phone = checkout?.shipping_address?.phone || checkout?.phone;
-    const queryField = checkout.email ? "email" : "phone";
-    const queryValue = checkout.email || phone;
+    const email = checkout.email;
     const res = await client.get({
       path: "orders",
       query: {
-        [queryField]: queryValue,
-        fields: "id, checkout_token, cart_token",
         status: "any",
         limit: 50,
       },
@@ -684,6 +628,60 @@ async function verifyCheckout(checkout) {
           `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
         );
         return; // Change
+      }
+
+      if (orders?.length) {
+        const matchingOrder = orders.find((o) => {
+          const orderPhones = [
+            o.phone,
+            o?.customer?.phone,
+            o?.customer?.default_address?.phone,
+            o?.shipping_address?.phone,
+          ].filter(Boolean);
+
+          const phoneMatches =
+            phone && orderPhones.some((p) => p.includes(phone));
+
+          const priceMatches =
+            Number(o.total_price) === Number(checkout.total_price);
+
+          return phoneMatches && priceMatches;
+        });
+
+        if (matchingOrder) {
+          console.log(
+            `Duplicate order detected for phone ${phone} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`
+          );
+          return;
+        }
+
+        console.log(
+          `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`
+        );
+      }
+
+      if (orders?.length) {
+        const matchingOrder = orders.find((o) => {
+          const orderEmails = [o?.email, o?.customer?.email].filter(Boolean);
+
+          const emailMatches = email && orderEmails.some((e) => e === email);
+
+          const priceMatches =
+            Number(o.total_price) === Number(checkout.total_price);
+
+          return emailMatches && priceMatches;
+        });
+
+        if (matchingOrder) {
+          console.log(
+            `Duplicate order detected for email ${email} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`
+          );
+          return;
+        }
+
+        console.log(
+          `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`
+        );
       }
     }
   } catch (err) {
@@ -802,8 +800,7 @@ setInterval(() => {
       const rawPhone = shipping?.phone || checkout.phone || "";
       const hasValidPhone = rawPhone.replace(/\D/g, "").length >= 10;
 
-      const hasContactInfo =
-        (hasValidPhone || email);
+      const hasContactInfo = hasValidPhone || email;
 
       if (hasContactInfo) {
         console.log(`Processing cart_token: ${cart_token}`);
