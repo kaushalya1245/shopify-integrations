@@ -68,29 +68,19 @@ const dataFiles = {
 };
 
 // async function getPayments() {
-// const todaysPayments = await razorpayClient.fetchTodaysPayments();
-// if (!todaysPayments || !todaysPayments.items) {
-//   console.log("No payments found for today.");
-// } else {
-//   const matchingPayments = todaysPayments.items.map((payment) => {
-//     if (payment.status !== "captured") return;
-//     if (!payment?.notes?.cancelUrl) return;
-//     return (payment.amount / 100);
-//   });
-//   console.log(matchingPayments);
-//   console.log(matchingPayments.length);
-// }
-
-// const res = await client.get({
-//   path: "orders",
-//   query: {
-//     email: "shreya.sppratik@gmail.com",
-//     status: "any",
-//     limit: 10,
-//   },
-// });
-// const orders = res.body.orders;
-// console.log(orders);
+//   const todaysPayments = await razorpayClient.fetchTodaysPayments();
+//   if (!todaysPayments || !todaysPayments.items) {
+//     console.log("No payments found for today.");
+//   } else {
+//     const matchingPayments = todaysPayments.items
+//       .map((payment) => {
+//         if (payment.status !== "captured") return;
+//         if (!payment?.notes?.cancelUrl) return;
+//         return payment;
+//       })
+//       .filter((p) => p !== undefined);
+//     console.log(matchingPayments.length);
+//   }
 // }
 
 // getPayments();
@@ -300,7 +290,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     );
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
-    console.error("Abandoned checkout message error: ", err);
+    console.error("Abandoned checkout message error: ", err.response.data);
     console.log(
       `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`
     );
@@ -346,19 +336,39 @@ async function createOrderFromPayment(checkout, payment) {
       : `+${sanitizedPhone}`;
 
   let customerId = null;
+
   try {
-    const res = await client.get({
+    let res = await client.get({
       path: "customers/search",
       query: { phone: `${formattedPhone}` },
     });
+
     if (res.body.customers?.length > 0) {
       customerId = res.body.customers?.[0]?.id || null;
-      console.log("Found customer id:", customerId);
-    } else {
-      console.log("ℹ️ No existing customer found with phone:", formattedPhone);
+      console.log("✅ Found customer by phone:", customerId);
+    } else if (checkout.email) {
+      console.log(
+        "ℹ️ No customer found by phone. Trying by email:",
+        checkout.email
+      );
+
+      res = await client.get({
+        path: "customers/search",
+        query: { email: `${checkout.email}` },
+      });
+
+      if (res.body.customers?.length > 0) {
+        customerId = res.body.customers?.[0]?.id || null;
+        console.log("✅ Found customer by email:", customerId);
+      } else {
+        console.log("❌ No existing customer found by phone or email.");
+      }
     }
   } catch (error) {
-    console.error("Error fetching customer by phone:", error);
+    console.error(
+      "Error fetching customer:",
+      error.response?.data || error.message
+    );
     return;
   }
 
@@ -685,7 +695,7 @@ async function verifyCheckout(checkout) {
       }
     }
   } catch (err) {
-    console.error("Failed to fetch orders:", err);
+    console.error("Failed to fetch orders:", err.response.data);
   }
 
   try {
