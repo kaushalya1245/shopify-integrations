@@ -393,9 +393,11 @@ async function createOrderFromPayment(checkout, payment) {
     };
   }
 
+  const includeEmail = !customerId && checkout.email;
+
   const orderPayload = {
     order: {
-      email: checkout.email,
+      ...(includeEmail && { email: checkout.email }),
       phone:
         checkout.phone ||
         checkout.shipping_address?.phone ||
