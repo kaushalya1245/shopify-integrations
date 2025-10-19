@@ -1030,10 +1030,14 @@ async function sendOrderConfirmation(order) {
 
     let orderStatusURL = `${process.env.SHOP_URL}/account/order/${order.id}`;
     if (order.order_status_url) {
-      orderStatusURL = order.order_status_url.replace(
-        `https://${process.env.HOST_NAME}/`,
-        ""
-      );
+      orderStatusURL = (() => {
+        try {
+          const url = new URL(order.order_status_url);
+          return url.pathname.replace(/^\//, "");
+        } catch {
+          return order.order_status_url;
+        }
+      })();
     }
 
     const payload = {
