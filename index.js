@@ -1,5 +1,7 @@
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -27,6 +29,8 @@ app.use(
     },
   })
 );
+
+app.use(express.urlencoded({ extended: true }));
 
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
@@ -1374,69 +1378,78 @@ app.get("/redirect_for_shipment", (req, res) => {
   return res.redirect(target);
 });
 
-app.get("/order-tracking", async (req, res) => {
+function corsForOrderTracking(req, res, next) {
+  // If no origin (server-to-server or curl), allow it
+  const origin = req.headers.origin;
+  if (!origin) return next();
+
+  const SHOPIFY_FRONTEND_ORIGINS = [
+    "https://bsseje-4d.myshopify.com",
+    "https://de5ebb-74.myshopify.com",
+  ]
+
+  if (SHOPIFY_FRONTEND_ORIGINS.includes(origin)) {
+    // Use cors middleware dynamically for this request
+    return cors({
+      origin: origin,
+      methods: ["GET", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+      credentials: false,
+    })(req, res, next);
+  } else {
+    // Origin not allowed -> respond with 403 for browser calls
+    return res.status(403).json({ error: "CORS origin denied" });
+  }
+}
+
+app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   try {
-    const { order, email } = req.query;
+    const { order, email, order_id } = req.query;
 
-    if (!order || !email) {
-      return res.status(400).json({ error: "Missing order number or email" });
+    // --- 1️⃣ Validate input ---
+    if (!order && !order_id) {
+      return res.status(400).json({
+        error: "Please provide either an order number or an order_id.",
+      });
     }
 
-    // Fetch orders with matching email
-    const response = await client.get({
-      path: "orders",
-      query: {
-        email: email,
-        status: "any",
-        limit: 50,
-      },
-    });
+    // --- 2️⃣ If order_id is provided, fetch fulfillment directly ---
+    if (order_id) {
+      try {
+        const fulfillmentsRes = await client.get({
+          path: `orders/${order_id}/fulfillments`,
+        });
 
-    const orders = response.body.orders;
-    if (!orders || !orders.length) {
-      return res.status(404).json({ error: "No orders found for this email." });
-    }
-
-    // Match specific order number (Shopify order name like #KAJ1234)
-    const orderMatch = orders.find(
-      (o) => o.name.replace("#", "") === order.replace("#", "")
-    );
-
-    if (!orderMatch) {
-      return res.status(404).json({ error: "Order not found." });
-    }
-
-    // Extract fulfillment data if available
-    const fulfillment = orderMatch.fulfillments?.[0] || null;
-    const trackingData = fulfillment
-      ? {
-          tracking_number: fulfillment.tracking_number,
-          tracking_url: fulfillment.tracking_url,
-          courier: fulfillment.tracking_company || "Not specified",
-          estimated_delivery: fulfillment.estimated_delivery_at || null,
-          status: fulfillment.status || orderMatch.fulfillment_status,
+        const fulfillments = fulfillmentsRes.body.fulfillments || [];
+        if (!fulfillments.length) {
+          return res.status(404).json({
+            message: `No fulfillment found for order ID ${order_id}`,
+          });
         }
-      : null;
 
-    // Return order info
-    return res.json({
-      order: {
-        id: orderMatch.id,
-        name: orderMatch.name,
-        created_at: orderMatch.created_at,
-        financial_status: orderMatch.financial_status,
-        fulfillment_status: orderMatch.fulfillment_status,
-        total_price: orderMatch.total_price,
-        currency: orderMatch.currency,
-        line_items: orderMatch.line_items.map((item) => ({
-          title: item.title,
-          quantity: item.quantity,
-          price: item.price,
-          image: item.image?.src || null,
-        })),
-        tracking: trackingData,
-      },
-    });
+        const latest = fulfillments[fulfillments.length - 1];
+        const trackingInfo = {
+          tracking_number: latest.tracking_number || "Not Available",
+          tracking_url: latest.tracking_url || null,
+          courier: latest.tracking_company || "Not Specified",
+          status: latest.shipment_status || "pending",
+          estimated_delivery: latest.estimated_delivery_at || null,
+        };
+
+        return res.json({
+          order_id,
+          tracking: trackingInfo,
+        });
+      } catch (err) {
+        console.error(
+          "Error fetching fulfillment by order_id:",
+          err.response?.data || err.message
+        );
+        return res
+          .status(500)
+          .json({ error: "Failed to fetch tracking info by order ID." });
+      }
+    }
   } catch (error) {
     console.error(
       "❌ Order tracking error:",

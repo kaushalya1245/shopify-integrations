@@ -9,6 +9,7 @@
     "@shopify/shopify-api": "^11.13.0",
     "axios": "^1.9.0",
     "cheerio": "^1.1.2",
+    "cors": "^2.8.5",
     "country-data": "^0.0.31",
     "crypto": "^1.0.1",
     "dotenv": "^16.5.0",
