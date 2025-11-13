@@ -1384,8 +1384,8 @@ function corsForOrderTracking(req, res, next) {
 
   // Allow Shopify domains
   const SHOPIFY_FRONTEND_ORIGINS = [
-    "https://bsseje-4d.myshopify.com",
     "https://de5ebb-74.myshopify.com",
+    "https://www.kaushalyaartjewellery.com",
   ];
 
   // ✅ If the origin is allowed, apply dynamic CORS headers
