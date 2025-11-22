@@ -1627,6 +1627,109 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
   }
 });
 
+// Refund processed webhook (handles Razorpay nested payloads)
+app.post("/webhook/refund-processed", async (req, res) => {
+  // Quick ACK to webhook sender
+  res.status(200).send("Refund webhook received");
+
+  const body = req.body || {};
+
+  // Normalize payload shapes (Razorpay: { payload: { refund: { entity }, payment: { entity } } })
+  const refundEntity = body.payload?.refund?.entity || body.refund?.entity || body.refund || body;
+  const paymentEntity = body.payload?.payment?.entity || body.payment?.entity || body.payment || null;
+
+  try {
+    const refundId = refundEntity?.id || refundEntity?.refund_id || JSON.stringify(refundEntity).slice(0, 200);
+    global.__processedRefunds = global.__processedRefunds || new Set();
+    if (global.__processedRefunds.has(refundId)) {
+      console.log("Refund already processed:", refundId);
+      return;
+    }
+    global.__processedRefunds.add(refundId);
+
+    (async () => {
+      try {
+        // Amount (Razorpay amounts are in paise)
+        const rawAmount = refundEntity?.amount || refundEntity?.amount_refunded || 0;
+        const currency = (refundEntity?.currency || paymentEntity?.currency || "INR").toString();
+        const formatAmount = (a, cur) => {
+          if (typeof a === "number") {
+            if (cur && cur.toUpperCase() === "INR") return (a / 100).toFixed(2);
+            return a.toFixed(2);
+          }
+          const n = Number(a);
+          if (!isNaN(n)) return cur && cur.toUpperCase() === "INR" ? (n / 100).toFixed(2) : n.toFixed(2);
+          return "0";
+        };
+        const amount = formatAmount(rawAmount, currency);
+
+        // Extract phone (prefer payment.contact)
+        const rawPhone = (paymentEntity?.contact || refundEntity?.contact || refundEntity?.notes?.contact || "").toString();
+        const cleanedPhone = rawPhone.replace(/\D/g, "").slice(-10);
+        const countryCode = "IN";
+        const dialCode = getDialCode(countryCode) || "+91";
+        const phoneNumber = dialCode + cleanedPhone;
+
+        // Resolve Shopify order: direct id or search by phone/email
+        let shopifyOrder = null;
+        const possibleOrderId = paymentEntity?.order_id || refundEntity?.order_id || refundEntity?.order_number;
+        if (possibleOrderId && /^[0-9]+$/.test(String(possibleOrderId))) {
+          try {
+            const or = await client.get({ path: `orders/${possibleOrderId}` });
+            shopifyOrder = or.body.order || null;
+          } catch (err) {
+            // continue to fallback search
+          }
+        }
+
+        if (!shopifyOrder) {
+          try {
+            let resp = null;
+            if (cleanedPhone) {
+              resp = await client.get({ path: "orders", query: { status: "any", limit: 1, phone: cleanedPhone } });
+            }
+            if ((!resp || !resp.body?.orders?.length) && paymentEntity?.email) {
+              resp = await client.get({ path: "orders", query: { status: "any", limit: 1, email: paymentEntity.email } });
+            }
+            if (resp && resp.body?.orders?.length) shopifyOrder = resp.body.orders[0];
+          } catch (err) {
+            // ignore
+          }
+        }
+
+        // const orderName = shopifyOrder?.name || possibleOrderId || "Unknown Order";
+        // const name = shopifyOrder?.shipping_address?.first_name || shopifyOrder?.customer?.first_name || refundEntity?.notes?.comment || "Customer";
+
+        // Refund template expects: {{1}} = amount, {{2}} = refund method (capitalized)
+        const rawMethod = (paymentEntity?.method || refundEntity?.method || paymentEntity?.payment_method || "").toString();
+        const method = rawMethod
+          ? rawMethod.toLowerCase().replace(/(^|\s)\S/g, (t) => t.toUpperCase())
+          : "";
+
+        const aiPayload = {
+          apiKey: process.env.AISENSY_API_KEY,
+          campaignName: process.env.RP_CAMPAIGN_NAME,
+          destination: phoneNumber,
+          userName: "Customer",
+          source: "refund",
+          templateParams: [`₹${amount}`, method],
+        };
+
+        try {
+          const r = await axios.post("https://backend.aisensy.com/campaign/t1/api/v2", aiPayload);
+          console.log("Refund message sent:", r.data || "(no body)");
+        } catch (err) {
+          console.error("Failed to send refund message:", err?.response?.data || err.message);
+        }
+      } catch (err) {
+        console.error("Unexpected error processing refund webhook:", err?.message || err);
+      }
+    })();
+  } catch (err) {
+    console.error("Refund webhook handler error:", err?.message || err);
+  }
+});
+
 // --- Start server ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
