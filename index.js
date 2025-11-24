@@ -1712,7 +1712,7 @@ app.post("/webhook/refund-processed", async (req, res) => {
           destination: phoneNumber,
           userName: "Customer",
           source: "refund",
-          templateParams: [`₹${amount}`, method],
+          templateParams: [`${amount}`, method],
         };
 
         try {
