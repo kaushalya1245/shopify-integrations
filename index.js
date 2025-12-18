@@ -770,27 +770,27 @@ async function verifyCheckout(checkout) {
 
       processingPayments.add(capturedPayment.id);
 
-      try {
-        if (processedPayments.has(capturedPayment.id)) {
-          console.log(
-            `Payment ${capturedPayment.id} already processed. Skipping.`
-          );
-          return;
-        }
+      // try {
+      //   if (processedPayments.has(capturedPayment.id)) {
+      //     console.log(
+      //       `Payment ${capturedPayment.id} already processed. Skipping.`
+      //     );
+      //     return;
+      //   }
 
-        console.log(
-          `Captured payment found for checkout ${checkout.cart_token}:`,
-          capturedPayment.contact,
-          capturedPayment.id,
-          new Date(capturedPayment.created_at * 1000).toLocaleString()
-        );
+      //   console.log(
+      //     `Captured payment found for checkout ${checkout.cart_token}:`,
+      //     capturedPayment.contact,
+      //     capturedPayment.id,
+      //     new Date(capturedPayment.created_at * 1000).toLocaleString()
+      //   );
 
-        await createOrderFromPayment(checkout, capturedPayment);
-        saveSet(dataFiles.payments, processedPayments, capturedPayment.id);
-      } finally {
-        processingPayments.delete(capturedPayment.id);
-        unlockId(capturedPayment.id);
-      }
+      //   await createOrderFromPayment(checkout, capturedPayment);
+      //   saveSet(dataFiles.payments, processedPayments, capturedPayment.id);
+      // } finally {
+      //   processingPayments.delete(capturedPayment.id);
+      //   unlockId(capturedPayment.id);
+      // }
     }
   } catch (error) {
     console.error("Error fetching payments");
@@ -1712,7 +1712,7 @@ app.post("/webhook/refund-processed", async (req, res) => {
           destination: phoneNumber,
           userName: "Customer",
           source: "refund",
-          templateParams: [`₹${amount}`, method],
+          templateParams: [`${amount}`, method],
         };
 
         try {
