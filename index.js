@@ -1367,6 +1367,73 @@ app.post("/webhook/fulfillment-creation", (req, res) => {
   sendFulfillmentMessage(fulfillment);
 });
 
+// --- Order Cancellation ---
+app.post("/webhook/order-cancellation", (req, res) => {
+  res.status(200).send("Order cancellation webhook received");
+
+  const payload = req.body || {};
+  const order = payload.order || payload;
+  const orderId = order?.id || order?.order_id;
+
+  if (!orderId) {
+    console.log("Order cancellation webhook received with no order id. Skipping.");
+    return;
+  }
+
+  global.__processedCancellations = global.__processedCancellations || new Set();
+  if (global.__processedCancellations.has(String(orderId))) {
+    console.log(`Order cancellation ${orderId} already processed`);
+    return;
+  }
+  global.__processedCancellations.add(String(orderId));
+  (async () => {
+    try {
+      console.log(`Processing cancellation for order ${orderId} (sending WhatsApp)`);
+
+      // Use provided payload; fetch full order only to enrich message if available
+      let fullOrder = order;
+      try {
+        const or = await client.get({ path: `orders/${orderId}` });
+        fullOrder = or.body.order || fullOrder;
+      } catch (err) {
+        // ignore — proceed with payload
+      }
+
+      const customer = fullOrder.customer || {};
+      const shipping = fullOrder.shipping_address || {};
+      const name = shipping.first_name || customer.first_name || "Customer";
+      const orderName = fullOrder.name ? fullOrder.name.replace("#", "") : String(orderId);
+      const amount = fullOrder.total_price || fullOrder.subtotal_price || "0";
+
+      const countryCode =
+        shipping?.country_code || fullOrder?.billing_address?.country_code || "IN";
+      const dialCode = getDialCode(countryCode) || "+91";
+
+      const rawPhone = shipping.phone || customer.phone || fullOrder.phone || "";
+      const cleanedPhone = rawPhone.replace(/\D/g, "").slice(-10);
+      const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+      const payload = {
+        apiKey: process.env.AISENSY_API_KEY,
+        campaignName: process.env.OCD_CAMPAIGN_NAME || process.env.OCD_CAMPAIGN_NAME,
+        destination: phoneNumberInternationalFormat,
+        userName: name,
+        source: "order_cancellation",
+        templateParams: [name, `${orderName}`, `₹${amount}`],
+      };
+
+      try {
+        const resp = await axios.post("https://backend.aisensy.com/campaign/t1/api/v2", payload);
+        console.log(`Order cancellation WhatsApp sent for order ${orderId}:`, resp.data || "(no body)");
+      } catch (err) {
+        console.error("Failed to send order cancellation WhatsApp:", err.response?.data || err.message);
+      }
+    } catch (err) {
+      console.error("Unexpected error processing order cancellation:", err?.message);
+    }
+  })();
+});
+
 // --- Redirect Service ---
 app.get("/redirect_for_shipment", (req, res) => {
   const target = req.query.link;
