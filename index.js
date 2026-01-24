@@ -15,6 +15,9 @@ const { razorpayClient } = require("./razorpayClient");
 const { countries } = require("country-data");
 const cheerio = require("cheerio");
 
+const DOUBLETICK_TEMPLATE_ENDPOINT =
+  "https://public.doubletick.io/whatsapp/message/template";
+
 const app = express();
 
 app.use((req, res, next) => {
@@ -34,7 +37,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
-const SEND_MESSAGE_DELAY = 60 * 60 * 1000; // Change
+const SEND_MESSAGE_DELAY = 1 * 60 * 1000; // Change
 const MINUTES_FOR_PAYMENT_CHECK = 120; // Payment check from 2 hours ago
 const MINUTES_FOR_ORDER_CHECK = 120 * 60 * 1000; // Order check from 2 hours ago
 let isSending = false;
@@ -142,6 +145,87 @@ function saveSet(filePath, dataset, item, type = "set") {
     dataset.add(item);
     fs.writeFileSync(filePath, JSON.stringify(Array.from(dataset)));
   }
+}
+
+function normalizeToDoubleTickTo(to) {
+  const digitsOnly = String(to || "").replace(/\D/g, "");
+  if (!digitsOnly) return "";
+
+  // DoubleTick examples use countrycode+number without '+' (e.g. 91XXXXXXXXXX)
+  if (digitsOnly.length === 10) return `91${digitsOnly}`;
+  return digitsOnly;
+}
+
+async function sendDoubleTickTemplateMessage({
+  to,
+  templateName,
+  language = "en",
+  bodyPlaceholders = [],
+  headerImageUrl,
+  headerFilename,
+  buttonUrl,
+}) {
+  const apiKey = process.env.DOUBLETICK_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "Missing DOUBLETICK_API_KEY env var (set it to the 'key_...' value)"
+    );
+  }
+
+  if (!templateName) {
+    throw new Error("Missing DoubleTick templateName");
+  }
+
+  const toNormalized = normalizeToDoubleTickTo(to);
+  if (!toNormalized) {
+    throw new Error("Missing/invalid destination phone number");
+  }
+
+  const payload = {
+    messages: [
+      {
+        to: toNormalized,
+        from: "+919136524727",
+        content: {
+          templateName,
+          language,
+          templateData: {
+            ...(headerImageUrl
+              ? {
+                  header: {
+                    type: "IMAGE",
+                    mediaUrl: headerImageUrl,
+                    filename: headerFilename || "image.jpeg",
+                  },
+                }
+              : {}),
+            body: {
+              placeholders: (bodyPlaceholders || []).map((v) =>
+                v === null || v === undefined ? "" : String(v)
+              ),
+            },
+            ...(buttonUrl
+              ? {
+                  buttons: [
+                    {
+                      type: "URL",
+                      parameter: String(buttonUrl),
+                    },
+                  ],
+                }
+              : {}),
+          },
+        },
+      },
+    ],
+  };
+
+  return axios.post(DOUBLETICK_TEMPLATE_ENDPOINT, payload, {
+    headers: {
+      Authorization: apiKey,
+      "Content-Type": "application/json",
+    },
+  });
 }
 
 // --- Locks ---
@@ -264,37 +348,30 @@ async function handleAbandonedCheckoutMessage(checkout) {
   const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
   const payload = {
-    apiKey: process.env.AISENSY_API_KEY,
-    campaignName: process.env.AC_CAMPAIGN_NAME,
-    destination: phoneNumberInternationalFormat,
-    userName: name,
-    source: "organic",
-    templateParams: [name, amount, abandonedCheckoutUrl],
-    media: {
-      url: imageUrl,
-      filename: "product.jpg",
-    },
-    buttons: [
-      {
-        type: "button",
-        sub_type: "url",
-        index: "0",
-        parameters: [{ type: "text", text: abandonedCheckoutUrl }],
-      },
-    ],
+    to: phoneNumberInternationalFormat,
+    from: "+919136524727",
+    templateName:
+      process.env.AC_CAMPAIGN_NAME ||
+      process.env.AC_TEMPLATE_NAME ||
+      "kaj_abandoned_checkout_v1",
+    language: process.env.DT_LANGUAGE || "en",
+    bodyPlaceholders: [name, `₹${amount}`],
+    headerImageUrl: imageUrl,
+    headerFilename: "product.jpg",
+    buttonUrl: abandonedCheckoutUrl,
   };
 
   try {
-    const response = await axios.post(
-      "https://backend.aisensy.com/campaign/t1/api/v2",
-      payload
-    );
+    const response = await sendDoubleTickTemplateMessage(payload);
     console.log(
       `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
     );
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
-    console.error("Abandoned checkout message error: ", err.response.data);
+    console.error(
+      "Abandoned checkout message error: ",
+      err?.response?.data || err?.message
+    );
     console.log(
       `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`
     );
@@ -674,6 +751,9 @@ async function verifyCheckout(checkout) {
         console.log(
           `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`
         );
+
+        messageQueue.push({ checkout }); // Change
+        processQueue(); // Change
       }
 
       if (orders?.length) {
@@ -1047,36 +1127,30 @@ async function sendOrderConfirmation(order) {
     }
 
     const payload = {
-      apiKey: process.env.AISENSY_API_KEY,
-      campaignName: process.env.OC_CAMPAIGN_NAME,
-      destination: phoneNumberInternationalFormat,
-      userName: name,
-      source: "organic",
-      templateParams: [name, orderName, `₹${amount}`, orderStatusURL],
-      media: {
-        url: imageUrl,
-        filename: "order.jpg",
-      },
-      buttons: [
-        {
-          type: "button",
-          sub_type: "url",
-          index: "0",
-          parameters: [{ type: "text", text: orderStatusURL }],
-        },
-      ],
+      to: phoneNumberInternationalFormat,
+      from: "+919136524727",
+      templateName:
+        process.env.OC_CAMPAIGN_NAME ||
+        process.env.OC_TEMPLATE_NAME ||
+        "kaj_order_confirmation_v1",
+      language: process.env.DT_LANGUAGE || "en",
+      // Your provided curl uses 3 body placeholders + URL button
+      bodyPlaceholders: [name, orderName, `₹${amount}`],
+      headerImageUrl: imageUrl,
+      headerFilename: "order.jpg",
+      buttonUrl: orderStatusURL,
     };
 
     try {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      );
+      const response = await sendDoubleTickTemplateMessage(payload);
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
       console.log(`Order confirmation message sent for ${order.cart_token}`);
       console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
     } catch (err) {
-      console.error("Order confirmation message error");
+      console.error(
+        "Order confirmation message error",
+        err?.response?.data || err?.message
+      );
       console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
       if (err.response) {
         console.error("Response data:", err.response.data);
@@ -1171,13 +1245,14 @@ async function sendLowStockNotification(order) {
 
       if (currentStock < thresholdQuantity) {
         const payload = {
-          apiKey: process.env.AISENSY_API_KEY,
-          campaignName: process.env.LSA_CAMPAIGN_NAME,
-          destination: "+917715878352",
-          // destination: "+919309950513",
-          userName: "Admin",
-          source: "low_stock",
-          templateParams: [
+          to: "+917715878352",
+          from: "+919136524727",
+          templateName:
+            process.env.DT_TEMPLATE_LOW_STOCK ||
+            process.env.LSA_TEMPLATE_NAME ||
+            process.env.LSA_CAMPAIGN_NAME,
+          language: process.env.DT_LANGUAGE || "en",
+          bodyPlaceholders: [
             productTitle.toString(),
             productCode.toString(),
             productOption.toString() || "Default Variant",
@@ -1185,30 +1260,21 @@ async function sendLowStockNotification(order) {
             thresholdQuantity.toString(),
             viewInventoryUrl.toString(),
           ],
-          media: {
-            url: imageUrl,
-            filename: "product.jpg",
-          },
-          buttons: [
-            {
-              type: "button",
-              sub_type: "url",
-              index: "0",
-              parameters: [{ type: "text", text: viewInventoryUrl }],
-            },
-          ],
+          headerImageUrl: imageUrl,
+          headerFilename: "product.jpg",
+          buttonUrl: viewInventoryUrl,
         };
 
         try {
-          const response = await axios.post(
-            "https://backend.aisensy.com/campaign/t1/api/v2",
-            payload
-          );
+          await sendDoubleTickTemplateMessage(payload);
           console.log(
             `Low stock alert sent for ${productTitle} (${productOption})`
           );
         } catch (err) {
-          console.error("Low stock alert message error");
+          console.error(
+            "Low stock alert message error",
+            err?.response?.data || err?.message
+          );
           if (err.response) {
             console.error("Response data: ", err.response.data);
             console.error("Response status: ", err.response.status);
@@ -1294,46 +1360,30 @@ async function sendFulfillmentMessage(fulfillment) {
           ).src.split("?")[0];
         }
       } catch (imageError) {
-        console.error("Failed to fetch product image:", imageError);
+        console.error("Failed to fetch product image here:", imageError);
       }
     }
 
     const payload = {
-      apiKey: process.env.AISENSY_API_KEY,
-      campaignName: process.env.OST_CAMPAIGN_NAME,
-      destination: phoneNumberInternationalFormat,
-      userName: name,
-      source: "fulfillment",
-      templateParams: [
+      to: phoneNumberInternationalFormat,
+      from: "+919136524727",
+      templateName:
+        process.env.OST_CAMPAIGN_NAME ||
+        process.env.OST_TEMPLATE_NAME ||
+        "kaj_order_shipping_v1",
+      language: process.env.DT_LANGUAGE || "en",
+      bodyPlaceholders: [
         `${name}`,
         `${orderName}`,
         `${trackingNumber}`,
-        `${fulfillmentStatusURL}`,
       ],
-      media: {
-        url: imageUrl,
-        filename: "product.jpg",
-      },
-      buttons: [
-        {
-          type: "button",
-          sub_type: "url",
-          index: "0",
-          parameters: [
-            {
-              type: "text",
-              text: `${fulfillmentStatusURL}`,
-            },
-          ],
-        },
-      ],
+      headerImageUrl: imageUrl,
+      headerFilename: "product.jpg",
+      buttonUrl: fulfillmentStatusURL,
     };
 
     try {
-      const response = await axios.post(
-        "https://backend.aisensy.com/campaign/t1/api/v2",
-        payload
-      );
+      const response = await sendDoubleTickTemplateMessage(payload);
       saveSet(
         dataFiles.fulfillments,
         processedFulfillments,
@@ -1343,7 +1393,10 @@ async function sendFulfillmentMessage(fulfillment) {
       console.log("Fulfillment message sent:", response.data);
       console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
     } catch (err) {
-      console.error("Fulfillment message error");
+      console.error(
+        "Fulfillment message error",
+        err?.response?.data || err?.message
+      );
       console.log(`Fulfillment message cannot be sent`);
       if (err.response) {
         console.error("Response data:", err.response.data);
@@ -1414,16 +1467,18 @@ app.post("/webhook/order-cancellation", (req, res) => {
       const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
       const payload = {
-        apiKey: process.env.AISENSY_API_KEY,
-        campaignName: process.env.OCD_CAMPAIGN_NAME || process.env.OCD_CAMPAIGN_NAME,
-        destination: phoneNumberInternationalFormat,
-        userName: name,
-        source: "order_cancellation",
-        templateParams: [name, `${orderName}`, `₹${amount}`],
+        to: phoneNumberInternationalFormat,
+        from: "+919136524727",
+        templateName:
+          process.env.OCD_CAMPAIGN_NAME ||
+          process.env.OCD_TEMPLATE_NAME ||
+          "kaj_order_cancellation_v1",
+        language: process.env.DT_LANGUAGE || "en",
+        bodyPlaceholders: [name, `${orderName}`, `₹${amount}`],
       };
 
       try {
-        const resp = await axios.post("https://backend.aisensy.com/campaign/t1/api/v2", payload);
+        const resp = await sendDoubleTickTemplateMessage(payload);
         console.log(`Order cancellation WhatsApp sent for order ${orderId}:`, resp.data || "(no body)");
       } catch (err) {
         console.error("Failed to send order cancellation WhatsApp:", err.response?.data || err.message);
@@ -1774,16 +1829,18 @@ app.post("/webhook/refund-processed", async (req, res) => {
           : "";
 
         const aiPayload = {
-          apiKey: process.env.AISENSY_API_KEY,
-          campaignName: process.env.RP_CAMPAIGN_NAME,
-          destination: phoneNumber,
-          userName: "Customer",
-          source: "refund",
-          templateParams: [`${amount}`, method],
+          to: phoneNumber,
+          from: "+919136524727",
+          templateName:
+            process.env.DT_TEMPLATE_REFUND ||
+            process.env.RP_TEMPLATE_NAME ||
+            "kaj_refund_processed_v1",
+          language: process.env.DT_LANGUAGE || "en",
+          bodyPlaceholders: [`${amount}`, method],
         };
 
         try {
-          const r = await axios.post("https://backend.aisensy.com/campaign/t1/api/v2", aiPayload);
+          const r = await sendDoubleTickTemplateMessage(aiPayload);
           console.log("Refund message sent:", r.data || "(no body)");
         } catch (err) {
           console.error("Failed to send refund message:", err?.response?.data || err.message);
