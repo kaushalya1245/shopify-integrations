@@ -36,7 +36,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Message queue and suppression logic
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
-const SEND_MESSAGE_DELAY = 1 * 60 * 1000; // Change
+const SEND_MESSAGE_DELAY = 60 * 60 * 1000; // Change
 const MINUTES_FOR_PAYMENT_CHECK = 120; // Payment check from 2 hours ago
 let isSending = false;
 const messageQueue = [];
@@ -1815,7 +1815,7 @@ function parseDateMs(value) {
 
 function getReviewDelayMs() {
   const parsedDelayMs = Number(process.env.REVIEW_DELAY_MS);
-  return Number.isFinite(parsedDelayMs) ? parsedDelayMs : 1 * 60 * 1000;
+  return Number.isFinite(parsedDelayMs) ? parsedDelayMs : 1 * 24 * 60 * 60 * 1000;
 }
 
 async function attemptSendReviewForFulfillmentId(fulfillmentId) {
