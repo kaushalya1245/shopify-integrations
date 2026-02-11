@@ -1,8 +1,7 @@
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors");
-const bodyParser = require("body-parser");
 const axios = require("axios");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const {
@@ -28,9 +27,9 @@ app.use((req, res, next) => {
 app.use(
   express.json({
     verify: (req, res, buf) => {
-      req.rawBody = buf.toString("utf8");
+      req.rawBody = buf;
     },
-  })
+  }),
 );
 
 app.use(express.urlencoded({ extended: true }));
@@ -39,10 +38,28 @@ app.use(express.urlencoded({ extended: true }));
 const CHECK_INTERVAL = 60 * 1000; // 1 minute
 const SEND_MESSAGE_DELAY = 1 * 60 * 1000; // Change
 const MINUTES_FOR_PAYMENT_CHECK = 120; // Payment check from 2 hours ago
-const MINUTES_FOR_ORDER_CHECK = 120 * 60 * 1000; // Order check from 2 hours ago
 let isSending = false;
 const messageQueue = [];
 const processingPayments = new Set();
+const queuedAbandonedCartTokens = new Set();
+
+function enqueueAbandonedCheckout(checkout, reason = "") {
+  const cartToken = checkout?.cart_token;
+  if (!cartToken) return;
+
+  if (queuedAbandonedCartTokens.has(cartToken)) {
+    if (reason) {
+      console.log(
+        `Abandoned checkout already queued for cart_token: ${cartToken}. Skipping enqueue (${reason}).`,
+      );
+    }
+    return;
+  }
+
+  queuedAbandonedCartTokens.add(cartToken);
+  messageQueue.push({ checkout, cartToken });
+  processQueue();
+}
 
 const shopify = shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
@@ -70,54 +87,331 @@ const dataFiles = {
   checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
+  deliveries: path.resolve(__dirname, "processed-deliveries.json"),
+  deliveryReviewRecords: path.resolve(__dirname, "delivery-review-records.json"),
+  deliveryReviewFulfillments: path.resolve(
+    __dirname,
+    "delivery-review-fulfillments.json",
+  ),
+  storeCreditRefunds: path.resolve(
+    __dirname,
+    "processed-store-credit-refunds.json",
+  ),
   payments: path.resolve(__dirname, "processed-payments.json"),
   locks: path.resolve(__dirname, "in-process-locks.json"),
 };
 
-// async function getPayments() {
-//   const todaysPayments = await razorpayClient.fetchTodaysPayments();
-//   if (!todaysPayments || !todaysPayments.items) {
-//     console.log("No payments found for today.");
-//   } else {
-//     const matchingPayments = todaysPayments.items
-//       .map((payment) => {
-//         if (payment.status !== "captured") return;
-//         if (!payment?.notes?.cancelUrl) return;
-//         return payment;
-//       })
-//       .filter((p) => p !== undefined);
-//     console.log(matchingPayments.length);
-//   }
-// }
+const deliveryWebhookLogFile = path.resolve(
+  __dirname,
+  "delivery-webhook-logs.jsonl",
+);
 
-// getPayments();
+const storeCreditRefundWebhookLogFile = path.resolve(
+  __dirname,
+  "store-credit-refund-webhook-logs.jsonl",
+);
 
-// async function getOrders(phoneNumber) {
-//   const res = await client.get({
-//     path: "orders",
-//     query: {
-//       fields: "id, checkout_token, cart_token, email, phone, total_price",
-//       status: "any",
-//       limit: 250,
-//     },
-//   });
+const deliveryReviewLogFile = path.resolve(
+  __dirname,
+  "delivery-review-logs.jsonl",
+);
 
-//   const orders = res.body.orders;
-//   orders.find((order) => {
-//     if (
-//       (order.phone &&
-//         order.phone.indexOf(0) !== -1 &&
-//         order.total_price == "0") ||
-//       (order.email &&
-//         order.email.indexOf(null) !== -1 &&
-//         order.total_price == "8,502.00")
-//     ) {
-//       console.log(order);
-//     }
-//   });
-// }
+// In-memory timers to send review messages close to the target delay.
+// Persistence + periodic scan still acts as a fallback across restarts.
+const __reviewTimersByFulfillmentId = new Map();
 
-// getOrders("8921336443");
+function appendJsonlLog(filePath, entry) {
+  try {
+    fs.appendFileSync(
+      filePath,
+      `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
+      "utf8",
+    );
+  } catch (err) {
+    console.error("Failed to append log:", err?.message || err);
+  }
+}
+
+function verifyShopifyWebhookHmac(req) {
+  const hmacHeader = (req.get("X-Shopify-Hmac-Sha256") || "").trim();
+  if (!hmacHeader) return false;
+
+  const secret =
+    process.env.SHOPIFY_WEBHOOK_SECRET ||
+    process.env.SHOPIFY_API_SECRET ||
+    process.env.SHOPIFY_API_SECRET_KEY;
+  if (!secret) {
+    console.error(
+      "Missing SHOPIFY_WEBHOOK_SECRET (required to verify Shopify webhooks)",
+    );
+    return false;
+  }
+
+  const rawBody = req.rawBody;
+  const bodyBuffer = Buffer.isBuffer(rawBody)
+    ? rawBody
+    : Buffer.from(rawBody || "", "utf8");
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(bodyBuffer)
+    .digest("base64");
+
+  try {
+    const a = Buffer.from(digest, "utf8");
+    const b = Buffer.from(hmacHeader, "utf8");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function hasStoreCreditRefundBeenNotified(refundId) {
+  const set = loadSet(dataFiles.storeCreditRefunds, "set");
+  return set.has(String(refundId));
+}
+
+function markStoreCreditRefundNotified(refundId) {
+  const set = loadSet(dataFiles.storeCreditRefunds, "set");
+  set.add(String(refundId));
+  fs.writeFileSync(dataFiles.storeCreditRefunds, JSON.stringify(Array.from(set)));
+}
+
+function computeStoreCreditRefundAmount(refund) {
+  const transactions = Array.isArray(refund?.transactions)
+    ? refund.transactions
+    : [];
+
+  const normalizeGateway = (g) =>
+    String(g || "")
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .replace(/-/g, "_")
+      .trim();
+
+  const isStoreCreditGateway = (g) => {
+    const gw = normalizeGateway(g);
+    // Shopify commonly reports store credit refunds as "shopify_store_credit".
+    // Keep this flexible to avoid breaking on minor naming changes.
+    return gw === "store_credit" || gw === "shopify_store_credit" || gw.includes("store_credit");
+  };
+
+  const matches = transactions.filter(
+    (t) =>
+      t &&
+      String(t.kind || "").toLowerCase() === "refund" &&
+      isStoreCreditGateway(t.gateway) &&
+      String(t.status || "").toLowerCase() === "success",
+  );
+
+  const amount = matches.reduce((sum, t) => {
+    const n = Number(t.amount);
+    return sum + (Number.isFinite(n) ? n : 0);
+  }, 0);
+
+  const currency =
+    (matches.find((t) => t.currency)?.currency || refund?.currency || "INR").toString();
+
+  return { matches, amount, currency };
+}
+
+function formatMoney(amount, currency) {
+  const cur = String(currency || "").toUpperCase();
+  const n = Number(amount);
+  const safe = Number.isFinite(n) ? n : 0;
+
+  if (cur === "INR") return `₹${safe.toFixed(2)}`;
+  if (cur) return `${cur} ${safe.toFixed(2)}`;
+  return safe.toFixed(2);
+}
+
+async function resolveOrderRecipientForRefund(order) {
+  const shipping = order?.shipping_address || {};
+  const billing = order?.billing_address || {};
+  const customer = order?.customer || {};
+
+  const countryCode =
+    shipping.country_code || billing.country_code || customer.country_code || "IN";
+  const name =
+    shipping.first_name || customer.first_name || billing.first_name || "Customer";
+
+  const candidates = [
+    shipping.phone,
+    billing.phone,
+    customer.phone,
+    order?.phone,
+    customer?.default_address?.phone,
+  ];
+
+  for (const cand of candidates) {
+    const d = extractDigitsPhone(cand);
+    if (isLikelyValidWhatsAppNumberDigits(d)) {
+      return { name, countryCode, digits: d, source: "order.phone" };
+    }
+  }
+
+  return {
+    name,
+    countryCode,
+    digits: extractDigitsPhone(order?.phone),
+    source: "order.phone",
+  };
+}
+
+async function sendStoreCreditRefundNotification({ order, refund, amount, currency }) {
+  const recipient = await resolveOrderRecipientForRefund(order);
+  if (!isLikelyValidWhatsAppNumberDigits(recipient.digits)) {
+    const err = new Error(
+      `No valid phone number found for store credit notification (source=${recipient.source})`,
+    );
+    err.code = "NO_VALID_PHONE";
+    throw err;
+  }
+
+  const dialCode = getDialCode(recipient.countryCode || "IN") || "+91";
+  const cleanedPhone = recipient.digits.slice(-10);
+  const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+  const orderName = order?.name || (order?.id ? String(order.id) : "Unknown Order");
+  const name = recipient.name || "Customer";
+  const formattedAmount = formatMoney(amount, currency);
+
+  const payload = {
+    to: phoneNumberInternationalFormat,
+    templateName:
+      process.env.SCR_CAMPAIGN_NAME ||
+      "kaj_store_credit_refund_v2",
+    language: process.env.DT_LANGUAGE || "en",
+    // Template: Hi {{1}}, Store credit of {{2}} ... order {{3}}
+    bodyPlaceholders: [name, formattedAmount, String(orderName)],
+  };
+
+  const resp = await sendDoubleTickTemplateMessage(payload);
+  return { ok: true, providerResponse: resp?.data, recipientSource: recipient.source };
+}
+
+function extractDigitsPhone(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function isLikelyValidWhatsAppNumberDigits(digits) {
+  // Keep it simple: WhatsApp numbers are typically 10+ digits (incl. country code).
+  // We use 10 as minimum to avoid sending to junk like "555555".
+  return Boolean(digits) && digits.length >= 10;
+}
+
+async function resolveDeliveryRecipient(fulfillment) {
+  const dest = fulfillment?.destination || {};
+
+  // Prefer fulfillment destination info
+  const baseCountryCode = dest.country_code || "IN";
+  const baseName = dest.first_name || "Customer";
+  const baseDigits = extractDigitsPhone(dest.phone);
+
+  if (isLikelyValidWhatsAppNumberDigits(baseDigits)) {
+    return {
+      name: baseName,
+      countryCode: baseCountryCode,
+      digits: baseDigits,
+      source: "fulfillment.destination.phone",
+    };
+  }
+
+  // Fallback: fetch order to find a better phone
+  const orderId = fulfillment?.order_id;
+  if (!orderId) {
+    return {
+      name: baseName,
+      countryCode: baseCountryCode,
+      digits: baseDigits,
+      source: "fulfillment.destination.phone",
+    };
+  }
+
+  try {
+    const or = await client.get({ path: `orders/${orderId}` });
+    const order = or?.body?.order || {};
+    const shipping = order.shipping_address || {};
+    const billing = order.billing_address || {};
+    const customer = order.customer || {};
+
+    const countryCode =
+      shipping.country_code || billing.country_code || baseCountryCode || "IN";
+    const name = shipping.first_name || customer.first_name || baseName;
+
+    const candidates = [
+      shipping.phone,
+      billing.phone,
+      customer.phone,
+      order.phone,
+      customer?.default_address?.phone,
+    ];
+
+    for (const cand of candidates) {
+      const d = extractDigitsPhone(cand);
+      if (isLikelyValidWhatsAppNumberDigits(d)) {
+        return {
+          name,
+          countryCode,
+          digits: d,
+          source: "order.phone",
+        };
+      }
+    }
+  } catch (err) {
+    // ignore, we'll return base info
+  }
+
+  return {
+    name: baseName,
+    countryCode: baseCountryCode,
+    digits: baseDigits,
+    source: "fulfillment.destination.phone",
+  };
+}
+
+function pickFirstTrackingNumber(fulfillment) {
+  if (!fulfillment) return "";
+  if (fulfillment.tracking_number) return String(fulfillment.tracking_number);
+  if (
+    Array.isArray(fulfillment.tracking_numbers) &&
+    fulfillment.tracking_numbers.length
+  ) {
+    return String(fulfillment.tracking_numbers[0]);
+  }
+  if (
+    Array.isArray(fulfillment.tracking_info) &&
+    fulfillment.tracking_info.length
+  ) {
+    return String(fulfillment.tracking_info[0]?.number || "");
+  }
+  if (
+    fulfillment.tracking_info &&
+    typeof fulfillment.tracking_info === "object"
+  ) {
+    return String(fulfillment.tracking_info.number || "");
+  }
+  return "";
+}
+
+function pickCarrier(fulfillment) {
+  if (!fulfillment) return "";
+  if (fulfillment.tracking_company) return String(fulfillment.tracking_company);
+  if (
+    Array.isArray(fulfillment.tracking_info) &&
+    fulfillment.tracking_info.length
+  ) {
+    return String(fulfillment.tracking_info[0]?.company || "");
+  }
+  if (
+    fulfillment.tracking_info &&
+    typeof fulfillment.tracking_info === "object"
+  ) {
+    return String(fulfillment.tracking_info.company || "");
+  }
+  return "";
+}
 
 function loadSet(filePath, type = "set") {
   try {
@@ -168,7 +462,7 @@ async function sendDoubleTickTemplateMessage({
   const apiKey = process.env.DOUBLETICK_API_KEY;
   if (!apiKey) {
     throw new Error(
-      "Missing DOUBLETICK_API_KEY env var (set it to the 'key_...' value)"
+      "Missing DOUBLETICK_API_KEY env var (set it to the 'key_...' value)",
     );
   }
 
@@ -201,7 +495,7 @@ async function sendDoubleTickTemplateMessage({
               : {}),
             body: {
               placeholders: (bodyPlaceholders || []).map((v) =>
-                v === null || v === undefined ? "" : String(v)
+                v === null || v === undefined ? "" : String(v),
               ),
             },
             ...(buttonUrl
@@ -243,11 +537,6 @@ function saveLocks(locks) {
   fs.writeFileSync(dataFiles.locks, JSON.stringify(locks, null, 2));
 }
 
-function isLocked(id) {
-  const locks = loadLocks();
-  return Boolean(locks[id]);
-}
-
 function lockId(id) {
   const locks = loadLocks();
   if (locks[id]) return false;
@@ -266,12 +555,15 @@ function unlockId(id) {
 async function processQueue() {
   if (isSending || messageQueue.length === 0) return;
   isSending = true;
-  const { checkout } = messageQueue.shift();
+  const { checkout, cartToken } = messageQueue.shift();
   try {
     await handleAbandonedCheckoutMessage(checkout);
   } catch (err) {
     console.error("Abandoned checkout message failed", err);
   } finally {
+    if (cartToken) queuedAbandonedCartTokens.delete(cartToken);
+    else if (checkout?.cart_token)
+      queuedAbandonedCartTokens.delete(checkout.cart_token);
     isSending = false;
     setImmediate(processQueue);
   }
@@ -295,7 +587,7 @@ async function handleAbandonedCheckoutMessage(checkout) {
     !checkout.shipping_address?.phone
   ) {
     console.log(
-      "Skipping incomplete checkout for sending message (missing contact info)"
+      "Skipping incomplete checkout for sending message (missing contact info)",
     );
     return;
   }
@@ -322,13 +614,13 @@ async function handleAbandonedCheckoutMessage(checkout) {
   try {
     const variantRes = await axios.get(
       `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
-      headers
+      headers,
     );
     const imageId = variantRes.data.variant.image_id;
 
     const productImagesRes = await axios.get(
       `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
-      headers
+      headers,
     );
     const allImages = productImagesRes.data?.images || [];
 
@@ -364,16 +656,16 @@ async function handleAbandonedCheckoutMessage(checkout) {
   try {
     const response = await sendDoubleTickTemplateMessage(payload);
     console.log(
-      `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`
+      `Abandoned checkout message sent for cart_token: ${checkout.cart_token}.  Response: ${response.data}`,
     );
     console.log(`Abandoned checkout message sent to ${name} (${cleanedPhone})`);
   } catch (err) {
     console.error(
       "Abandoned checkout message error: ",
-      err?.response?.data || err?.message
+      err?.response?.data || err?.message,
     );
     console.log(
-      `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`
+      `Abandoned checkout message cannot be sent to ${name} (${cleanedPhone})`,
     );
     if (err.response) {
       console.error("Response data:", err.response.data);
@@ -430,7 +722,7 @@ async function createOrderFromPayment(checkout, payment) {
     } else if (checkout.email) {
       console.log(
         "ℹ️ No customer found by phone. Trying by email:",
-        checkout.email
+        checkout.email,
       );
 
       res = await client.get({
@@ -448,7 +740,7 @@ async function createOrderFromPayment(checkout, payment) {
   } catch (error) {
     console.error(
       "Error fetching customer:",
-      error.response?.data || error.message
+      error.response?.data || error.message,
     );
     return;
   }
@@ -526,7 +818,7 @@ async function createOrderFromPayment(checkout, payment) {
           price: parseFloat(
             checkout.shipping_lines[0]?.price ||
               checkout?.shipping_lines[0]?.original_shop_price ||
-              0
+              0,
           ).toFixed(2),
           code: checkout.shipping_lines[0]?.code || "Standard",
           source: "shopify",
@@ -568,7 +860,7 @@ async function createOrderFromPayment(checkout, payment) {
 
     console.log(
       "✅ Order created from abandoned checkout:",
-      orderResponse.body.order.id
+      orderResponse.body.order.id,
     );
 
     try {
@@ -593,7 +885,7 @@ async function createOrderFromPayment(checkout, payment) {
         try {
           const variantRes = await axios.get(
             `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
-            headers
+            headers,
           );
 
           if (!variantRes.data || !variantRes.data.variant) {
@@ -602,7 +894,7 @@ async function createOrderFromPayment(checkout, payment) {
           }
 
           console.log(
-            `Processing variant ${variantId} for inventory adjustment`
+            `Processing variant ${variantId} for inventory adjustment`,
           );
           if (!variantRes.data.variant.inventory_item_id) {
             console.log(`Variant ${variantId} has no inventory item ID`);
@@ -615,7 +907,7 @@ async function createOrderFromPayment(checkout, payment) {
             return;
           }
           console.log(
-            `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`
+            `Adjusting inventory for variant ${variantId} (item ID: ${inventoryItemId})`,
           );
 
           try {
@@ -632,7 +924,7 @@ async function createOrderFromPayment(checkout, payment) {
               if (!inventoryResponse) {
                 console.error(
                   `Failed to adjust inventory for variant ${variantId}:`,
-                  inventoryResponse
+                  inventoryResponse,
                 );
               }
             }
@@ -699,26 +991,26 @@ async function verifyCheckout(checkout) {
 
     if (orders) {
       const isOrderNotAbandoned = orders.find(
-        (o) => o.cart_token === checkout.cart_token
+        (o) => o.cart_token === checkout.cart_token,
       );
       if (isOrderNotAbandoned) {
         orderId = isOrderNotAbandoned.id;
         console.log(
-          `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`
+          `Checkout ${checkout.cart_token} is not abandoned. Skipping payment verification.`,
         );
         return; // Change
       } else {
         console.log(
-          `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`
+          `Checkout ${checkout.cart_token} is abandoned. Proceeding with payment verification.`,
         );
       }
 
       const isConverted = orders.find(
-        (o) => o.checkout_token === checkout.token
+        (o) => o.checkout_token === checkout.token,
       );
       if (isConverted) {
         console.log(
-          `Checkout ${checkout.token} already converted to order. Skipping payment verification.`
+          `Checkout ${checkout.token} already converted to order. Skipping payment verification.`,
         );
         return; // Change
       }
@@ -743,17 +1035,10 @@ async function verifyCheckout(checkout) {
 
         if (matchingOrder) {
           console.log(
-            `Duplicate order detected for phone ${phone} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`
+            `Duplicate order detected for phone ${phone} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`,
           );
           return;
         }
-
-        console.log(
-          `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`
-        );
-
-        messageQueue.push({ checkout }); // Change
-        processQueue(); // Change
       }
 
       if (orders?.length) {
@@ -770,13 +1055,13 @@ async function verifyCheckout(checkout) {
 
         if (matchingOrder) {
           console.log(
-            `Duplicate order detected for email ${email} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`
+            `Duplicate order detected for email ${email} with total_price ${checkout.total_price}. Order ID: ${matchingOrder.id}`,
           );
           return;
         }
 
         console.log(
-          `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`
+          `Checkout ${checkout.cart_token} seems abandoned. Proceeding with payment verification.`,
         );
       }
     }
@@ -812,7 +1097,7 @@ async function verifyCheckout(checkout) {
               perfectAmount === totalCheckoutPrice);
 
           const matchesCartToken = payment.notes.cancelUrl.includes(
-            checkout?.cart_token
+            checkout?.cart_token,
           );
 
           const isWithinTimeRange =
@@ -829,16 +1114,15 @@ async function verifyCheckout(checkout) {
 
       if (!capturedPayment) {
         console.log(
-          `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`
+          `No captured payments found for checkout ${checkout.cart_token}. Proceeding with message queueing.`,
         );
-        messageQueue.push({ checkout });
-        processQueue();
+        enqueueAbandonedCheckout(checkout, "no_captured_payment");
         return;
       }
 
       if (processingPayments.has(capturedPayment.id)) {
         console.log(
-          `⚠️ Payment ${capturedPayment.id} is being processed. Skipping.`
+          `⚠️ Payment ${capturedPayment.id} is being processed. Skipping.`,
         );
         return;
       }
@@ -929,7 +1213,7 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
     dataFiles.checkouts,
     checkouts,
     { cart_token, checkout },
-    "debounced"
+    "debounced",
   );
 });
 
@@ -1099,11 +1383,11 @@ async function sendOrderConfirmation(order) {
       try {
         const productImagesRes = await axios.get(
           `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
-          headers
+          headers,
         );
         if (productImagesRes?.data?.images?.length) {
           const variantImage = productImagesRes?.data?.images.find((img) =>
-            img.variant_ids.includes(variantId)
+            img.variant_ids.includes(variantId),
           );
           imageUrl = (
             variantImage || productImagesRes?.data?.images[0]
@@ -1132,7 +1416,7 @@ async function sendOrderConfirmation(order) {
       templateName:
         process.env.OC_CAMPAIGN_NAME ||
         process.env.OC_TEMPLATE_NAME ||
-        "kaj_order_confirmation_v1",
+        "kaj_order_confirmation_v3",
       language: process.env.DT_LANGUAGE || "en",
       // Your provided curl uses 3 body placeholders + URL button
       bodyPlaceholders: [name, orderName, `₹${amount}`],
@@ -1149,7 +1433,7 @@ async function sendOrderConfirmation(order) {
     } catch (err) {
       console.error(
         "Order confirmation message error",
-        err?.response?.data || err?.message
+        err?.response?.data || err?.message,
       );
       console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
       if (err.response) {
@@ -1198,13 +1482,13 @@ async function sendLowStockNotification(order) {
       // Get inventory_item_id for the variant
       const productRes = await axios.get(
         `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}.json`,
-        headers
+        headers,
       );
 
       // Get inventory_item_id for the variant
       const variantRes = await axios.get(
         `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/variants/${variantId}.json`,
-        headers
+        headers,
       );
 
       if (!variantRes.data || !variantRes.data.variant) {
@@ -1227,12 +1511,12 @@ async function sendLowStockNotification(order) {
       try {
         const productImagesRes = await axios.get(
           `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
-          headers
+          headers,
         );
 
         if (productImagesRes?.data?.images?.length > 0) {
           const variantImage = productImagesRes?.data?.images.find((img) =>
-            img.variant_ids.includes(variantId)
+            img.variant_ids.includes(variantId),
           );
           imageUrl = (
             variantImage || productImagesRes?.data?.images[0]
@@ -1268,12 +1552,12 @@ async function sendLowStockNotification(order) {
         try {
           await sendDoubleTickTemplateMessage(payload);
           console.log(
-            `Low stock alert sent for ${productTitle} (${productOption})`
+            `Low stock alert sent for ${productTitle} (${productOption})`,
           );
         } catch (err) {
           console.error(
             "Low stock alert message error",
-            err?.response?.data || err?.message
+            err?.response?.data || err?.message,
           );
           if (err.response) {
             console.error("Response data: ", err.response.data);
@@ -1285,7 +1569,7 @@ async function sendLowStockNotification(order) {
   } catch (error) {
     console.error(
       "❌ Error sending low stock alert: ",
-      error.response?.data || error.message
+      error.response?.data || error.message,
     );
   }
 }
@@ -1349,11 +1633,11 @@ async function sendFulfillmentMessage(fulfillment) {
       try {
         const productImagesRes = await axios.get(
           `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
-          headers
+          headers,
         );
         if (productImagesRes?.data?.images?.length > 0) {
           const variantImage = productImagesRes?.data?.images.find((img) =>
-            img.variant_ids.includes(variantId)
+            img.variant_ids.includes(variantId),
           );
           imageUrl = (
             variantImage || productImagesRes?.data?.images[0]
@@ -1372,11 +1656,7 @@ async function sendFulfillmentMessage(fulfillment) {
         process.env.OST_TEMPLATE_NAME ||
         "kaj_order_shipping_v1",
       language: process.env.DT_LANGUAGE || "en",
-      bodyPlaceholders: [
-        `${name}`,
-        `${orderName}`,
-        `${trackingNumber}`,
-      ],
+      bodyPlaceholders: [`${name}`, `${orderName}`, `${trackingNumber}`],
       headerImageUrl: imageUrl,
       headerFilename: "product.jpg",
       buttonUrl: fulfillmentStatusURL,
@@ -1388,14 +1668,14 @@ async function sendFulfillmentMessage(fulfillment) {
         dataFiles.fulfillments,
         processedFulfillments,
         fulfillment.id.toString(),
-        "set"
+        "set",
       );
       console.log("Fulfillment message sent:", response.data);
       console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error(
         "Fulfillment message error",
-        err?.response?.data || err?.message
+        err?.response?.data || err?.message,
       );
       console.log(`Fulfillment message cannot be sent`);
       if (err.response) {
@@ -1420,6 +1700,710 @@ app.post("/webhook/fulfillment-creation", (req, res) => {
   sendFulfillmentMessage(fulfillment);
 });
 
+// --- Fulfillment Update (Delivery Detection) ---
+// Shopify doesn't provide an order/delivered webhook.
+// Delivery is inferred from fulfillments/update where shipment_status === "delivered".
+async function sendDeliveryNotification(fulfillment) {
+  const orderId = fulfillment?.order_id;
+  const fulfillmentId = fulfillment?.id;
+  const shipmentStatus = fulfillment?.shipment_status;
+
+  const recipient = await resolveDeliveryRecipient(fulfillment);
+  const name = recipient.name || "Customer";
+
+  const orderName = fulfillment?.name
+    ? fulfillment.name.replace("#", "").split(".")[0]
+    : orderId
+      ? String(orderId)
+      : "Unknown Order";
+
+  const trackingNumber = pickFirstTrackingNumber(fulfillment) || "";
+  const carrier = pickCarrier(fulfillment) || "";
+
+  if (!isLikelyValidWhatsAppNumberDigits(recipient.digits)) {
+    const err = new Error(
+      `No valid phone number found for delivery notification (source=${recipient.source})`,
+    );
+    err.code = "NO_VALID_PHONE";
+    throw err;
+  }
+
+  const countryCode = recipient.countryCode || "IN";
+  const dialCode = getDialCode(countryCode) || "+91";
+  // Use last 10 digits to match existing message formatting
+  const cleanedPhone = recipient.digits.slice(-10);
+  const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+  const payload = {
+    to: phoneNumberInternationalFormat,
+    templateName:
+      process.env.OD_CAMPAIGN_NAME ||
+      "kaj_order_delivered_v3",
+    language: process.env.DT_LANGUAGE || "en",
+    // Template in screenshot: "Hi {{1}}, Your order {{2}} has been delivered..."
+    bodyPlaceholders: [name, `${orderName}`],
+  };
+
+  // Fire WhatsApp (or replace with SMS/Email integrations).
+  const resp = await sendDoubleTickTemplateMessage(payload);
+  return {
+    ok: true,
+    shipmentStatus,
+    orderId,
+    fulfillmentId,
+    trackingNumber,
+    carrier,
+    recipientSource: recipient.source,
+    providerResponse: resp?.data,
+  };
+}
+
+function hasDeliveryBeenNotified(key) {
+  // Read from disk for safety across restarts/instances
+  const set = loadSet(dataFiles.deliveries, "set");
+  return set.has(String(key));
+}
+
+function markDeliveryNotified(key) {
+  const set = loadSet(dataFiles.deliveries, "set");
+  set.add(String(key));
+  fs.writeFileSync(dataFiles.deliveries, JSON.stringify(Array.from(set)));
+}
+
+function loadDeliveryReviewRecords() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(dataFiles.deliveryReviewRecords, "utf8"));
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveDeliveryReviewRecords(records) {
+  fs.writeFileSync(
+    dataFiles.deliveryReviewRecords,
+    JSON.stringify(records || {}, null, 2),
+    "utf8",
+  );
+}
+
+function loadDeliveryReviewFulfillmentRecords() {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(dataFiles.deliveryReviewFulfillments, "utf8"),
+    );
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveDeliveryReviewFulfillmentRecords(records) {
+  fs.writeFileSync(
+    dataFiles.deliveryReviewFulfillments,
+    JSON.stringify(records || {}, null, 2),
+    "utf8",
+  );
+}
+
+function parseDateMs(value) {
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? t : null;
+}
+
+function getReviewDelayMs() {
+  const parsedDelayMs = Number(process.env.REVIEW_DELAY_MS);
+  return Number.isFinite(parsedDelayMs) ? parsedDelayMs : 1 * 60 * 1000;
+}
+
+async function attemptSendReviewForFulfillmentId(fulfillmentId) {
+  if (!fulfillmentId) return;
+
+  const lockKey = `review_send:${fulfillmentId}`;
+  if (!lockId(lockKey)) return;
+
+  try {
+    const records = loadDeliveryReviewFulfillmentRecords();
+    const rec = records[String(fulfillmentId)];
+    if (!rec || rec.reviewMessageSent) return;
+
+    const deliveredAtMs = Number(rec.deliveredAtMs);
+    if (!Number.isFinite(deliveredAtMs)) return;
+
+    const delayMs = getReviewDelayMs();
+    if (deliveredAtMs > Date.now() - delayMs) return;
+
+    const result = await sendOrderReviewRequestForRecord(rec);
+
+    records[String(fulfillmentId)] = {
+      ...rec,
+      reviewMessageSent: true,
+      reviewMessageSentAtMs: Date.now(),
+      reviewMessageSentAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    saveDeliveryReviewFulfillmentRecords(records);
+
+    appendJsonlLog(deliveryReviewLogFile, {
+      event: "review_message_sent",
+      order_id: rec.orderId || null,
+      fulfillment_id: fulfillmentId,
+      result: "notified",
+      notification: result,
+    });
+  } catch (err) {
+    appendJsonlLog(deliveryReviewLogFile, {
+      event: "review_message_sent",
+      order_id: null,
+      fulfillment_id: fulfillmentId,
+      result: "error",
+      error: err?.response?.data || err?.message || String(err),
+    });
+  } finally {
+    unlockId(lockKey);
+  }
+}
+
+function scheduleReviewSendForFulfillmentId(fulfillmentId, deliveredAtMs) {
+  if (!fulfillmentId) return;
+
+  const delayMs = getReviewDelayMs();
+  const dueAtMs =
+    (Number.isFinite(Number(deliveredAtMs)) ? Number(deliveredAtMs) : Date.now()) +
+    delayMs;
+  const msUntilDue = Math.max(0, dueAtMs - Date.now());
+
+  const existing = __reviewTimersByFulfillmentId.get(String(fulfillmentId));
+  if (existing?.timeoutId) {
+    clearTimeout(existing.timeoutId);
+  }
+
+  const timeoutId = setTimeout(() => {
+    __reviewTimersByFulfillmentId.delete(String(fulfillmentId));
+    attemptSendReviewForFulfillmentId(String(fulfillmentId)).catch(() => {});
+  }, msUntilDue);
+
+  __reviewTimersByFulfillmentId.set(String(fulfillmentId), { timeoutId, dueAtMs });
+}
+
+async function upsertDeliveryReviewRecordFromFulfillment(fulfillment, receivedAtMs) {
+  const orderId = fulfillment?.order_id;
+  if (!orderId) return;
+
+  const fulfillmentId = fulfillment?.id ? String(fulfillment.id) : null;
+  if (!fulfillmentId) return;
+  const deliveredAtMs =
+    parseDateMs(fulfillment?.updated_at) ||
+    parseDateMs(fulfillment?.delivered_at) ||
+    Number(receivedAtMs) ||
+    Date.now();
+
+  const orderName = fulfillment?.name
+    ? fulfillment.name.replace("#", "").split(".")[0]
+    : String(orderId);
+
+  const recipient = await resolveDeliveryRecipient(fulfillment);
+
+  const lockKey = `delivery_review_capture:${fulfillmentId}`;
+  if (!lockId(lockKey)) return;
+
+  try {
+    const records = loadDeliveryReviewFulfillmentRecords();
+    const key = String(fulfillmentId);
+    const prev = records[key] || {};
+
+    const prevDeliveredAtMs = Number(prev.deliveredAtMs);
+    const nextDeliveredAtMs =
+      Number.isFinite(prevDeliveredAtMs) && prevDeliveredAtMs > deliveredAtMs
+        ? prevDeliveredAtMs
+        : deliveredAtMs;
+
+    records[key] = {
+      fulfillmentId,
+      orderId: Number(orderId),
+      orderName,
+      deliveredAtMs: nextDeliveredAtMs,
+      deliveredAt: new Date(nextDeliveredAtMs).toISOString(),
+      recipient: {
+        name: recipient?.name || prev?.recipient?.name || "Customer",
+        countryCode:
+          recipient?.countryCode || prev?.recipient?.countryCode || "IN",
+        digits: recipient?.digits || prev?.recipient?.digits || "",
+        source: recipient?.source || prev?.recipient?.source || "unknown",
+      },
+      reviewMessageSent: Boolean(prev.reviewMessageSent),
+      reviewMessageSentAt: prev.reviewMessageSentAt || null,
+      reviewMessageSentAtMs: Number(prev.reviewMessageSentAtMs) || null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    saveDeliveryReviewFulfillmentRecords(records);
+
+    // Schedule review send ~delayMs after deliveredAt.
+    scheduleReviewSendForFulfillmentId(fulfillmentId, nextDeliveredAtMs);
+
+    appendJsonlLog(deliveryReviewLogFile, {
+      event: "delivery_captured",
+      order_id: orderId,
+      fulfillment_id: fulfillmentId,
+      delivered_at: new Date(nextDeliveredAtMs).toISOString(),
+      result: "ok",
+    });
+  } catch (err) {
+    appendJsonlLog(deliveryReviewLogFile, {
+      event: "delivery_captured",
+      order_id: orderId,
+      fulfillment_id: fulfillmentId,
+      result: "error",
+      error: err?.message || String(err),
+    });
+  } finally {
+    unlockId(lockKey);
+  }
+}
+
+function buildReviewButtonUrl({ orderId, orderName }) {
+  const tmpl = String(process.env.REVIEW_BUTTON_URL_TEMPLATE || "").trim();
+  const base = String(process.env.REVIEW_BUTTON_URL || "").trim();
+
+  if (tmpl) {
+    return tmpl
+      .replaceAll("{orderId}", String(orderId))
+      .replaceAll(
+        "{orderName}",
+        encodeURIComponent(String(orderName || "")),
+      );
+  }
+
+  return base;
+}
+
+async function sendOrderReviewRequestForRecord(record) {
+  const orderId = record?.orderId;
+  const orderName = record?.orderName || (orderId ? String(orderId) : "Unknown");
+
+  const recipient = record?.recipient || {};
+  const name = recipient?.name || "Customer";
+  const countryCode = recipient?.countryCode || "IN";
+  const digits = extractDigitsPhone(recipient?.digits);
+
+  if (!isLikelyValidWhatsAppNumberDigits(digits)) {
+    const err = new Error(
+      `No valid phone number found for review notification (orderId=${orderId})`,
+    );
+    err.code = "NO_VALID_PHONE";
+    throw err;
+  }
+
+  const dialCode = getDialCode(countryCode) || "+91";
+  const cleanedPhone = digits.slice(-10);
+  const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+  const buttonUrl = buildReviewButtonUrl({ orderId, orderName });
+  if (!buttonUrl) {
+    const err = new Error(
+      "Missing REVIEW_BUTTON_URL or REVIEW_BUTTON_URL_TEMPLATE for review message button",
+    );
+    err.code = "MISSING_REVIEW_URL";
+    throw err;
+  }
+
+  const payload = {
+    to: phoneNumberInternationalFormat,
+    templateName:
+      process.env.OR_CAMPAIGN_NAME ||
+      "kaj_order_review_v2",
+    language: process.env.DT_LANGUAGE || "en",
+    bodyPlaceholders: [name, String(orderName)],
+    buttonUrl,
+  };
+
+  const resp = await sendDoubleTickTemplateMessage(payload);
+  return {
+    ok: true,
+    orderId,
+    orderName,
+    recipientSource: recipient?.source || null,
+    providerResponse: resp?.data,
+  };
+}
+
+let __reviewSchedulerRunning = false;
+async function runReviewSchedulerOnce() {
+  const enabled =
+    String(process.env.REVIEW_SCHEDULER_ENABLED || "true").toLowerCase() !==
+    "false";
+  if (!enabled) return;
+
+  if (__reviewSchedulerRunning) return;
+  __reviewSchedulerRunning = true;
+
+  const lockKey = "review_scheduler";
+  if (!lockId(lockKey)) {
+    __reviewSchedulerRunning = false;
+    return;
+  }
+
+  try {
+    const now = Date.now();
+    const delayMs = getReviewDelayMs();
+
+    const records = loadDeliveryReviewFulfillmentRecords();
+    const list = Object.values(records || {}).filter(Boolean);
+
+    for (const rec of list) {
+      const orderId = rec?.orderId;
+      const fulfillmentId = rec?.fulfillmentId;
+      const deliveredAtMs = Number(rec?.deliveredAtMs);
+      if (!orderId || !fulfillmentId || !Number.isFinite(deliveredAtMs)) continue;
+
+      if (rec.reviewMessageSent) continue;
+      if (deliveredAtMs > now - delayMs) continue;
+
+      // Use the shared send path (handles idempotency + persistence).
+      await attemptSendReviewForFulfillmentId(String(fulfillmentId));
+    }
+  } finally {
+    unlockId(lockKey);
+    __reviewSchedulerRunning = false;
+  }
+}
+
+async function handleFulfillmentsUpdateWebhook(req, res) {
+  const allowUnverified =
+    String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
+    "true";
+
+  const topic = (req.get("X-Shopify-Topic") || "").trim();
+  const shopDomain = (req.get("X-Shopify-Shop-Domain") || "").trim();
+
+  // Only accept the specific Shopify topic we rely on for delivery status.
+  if (topic && topic !== "fulfillments/update") {
+    res.status(200).send("OK");
+    appendJsonlLog(deliveryWebhookLogFile, {
+      event: "fulfillments/update",
+      result: "ignored",
+      reason: "wrong_topic",
+      topic,
+      shop_domain: shopDomain || null,
+    });
+    return;
+  }
+
+  // Basic shop-domain allowlist. (HMAC is the real protection; this prevents obvious misroutes.)
+  if (process.env.SHOPIFY_DOMAIN && shopDomain && shopDomain !== process.env.SHOPIFY_DOMAIN) {
+    res.status(200).send("OK");
+    appendJsonlLog(deliveryWebhookLogFile, {
+      event: "fulfillments/update",
+      result: "ignored",
+      reason: "wrong_shop_domain",
+      topic: topic || null,
+      shop_domain: shopDomain,
+      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
+    });
+    return;
+  }
+
+  if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
+    appendJsonlLog(deliveryWebhookLogFile, {
+      event: "fulfillments/update",
+      result: "rejected",
+      reason: "invalid_hmac",
+      topic: topic || null,
+      shop_domain: shopDomain || null,
+    });
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  // Always acknowledge quickly to Shopify
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+  const fulfillment = payload.fulfillment || payload;
+
+  const shipmentStatus =
+    fulfillment?.shipment_status || payload?.shipment_status || "";
+  if (shipmentStatus !== "delivered") {
+    return;
+  }
+
+  const orderId = fulfillment?.order_id || payload?.order_id;
+  const fulfillmentId = fulfillment?.id || payload?.id;
+
+  const trackingNumber = pickFirstTrackingNumber(fulfillment) || "";
+  const carrier = pickCarrier(fulfillment) || "";
+
+  const idempotencyKey = fulfillmentId
+    ? String(fulfillmentId)
+    : `${orderId || "unknown"}:${trackingNumber || "unknown"}`;
+
+  // Capture delivery for 5-day review message scheduling (independent of delivered-message sending).
+  // This is per-order persistence and is idempotent.
+  (async () => {
+    try {
+      await upsertDeliveryReviewRecordFromFulfillment(fulfillment, Date.now());
+    } catch {
+      // errors already logged inside
+    }
+  })();
+
+  if (hasDeliveryBeenNotified(idempotencyKey)) {
+    appendJsonlLog(deliveryWebhookLogFile, {
+      event: "fulfillments/update",
+      shipment_status: shipmentStatus,
+      order_id: orderId || null,
+      fulfillment_id: fulfillmentId || null,
+      tracking_number: trackingNumber || null,
+      carrier: carrier || null,
+      result: "ignored",
+      reason: "already_notified",
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  const lockKey = `delivery:${idempotencyKey}`;
+  if (!lockId(lockKey)) {
+    appendJsonlLog(deliveryWebhookLogFile, {
+      event: "fulfillments/update",
+      shipment_status: shipmentStatus,
+      order_id: orderId || null,
+      fulfillment_id: fulfillmentId || null,
+      result: "ignored",
+      reason: "locked",
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  (async () => {
+    try {
+      if (hasDeliveryBeenNotified(idempotencyKey)) return;
+
+      const result = await sendDeliveryNotification(fulfillment);
+      markDeliveryNotified(idempotencyKey);
+
+      appendJsonlLog(deliveryWebhookLogFile, {
+        event: "fulfillments/update",
+        shipment_status: shipmentStatus,
+        order_id: orderId || null,
+        fulfillment_id: fulfillmentId || null,
+        tracking_number: trackingNumber || null,
+        carrier: carrier || null,
+        result: "notified",
+        idempotency_key: idempotencyKey,
+        notification: result,
+        payload: fulfillment,
+      });
+    } catch (err) {
+      appendJsonlLog(deliveryWebhookLogFile, {
+        event: "fulfillments/update",
+        shipment_status: shipmentStatus,
+        order_id: orderId || null,
+        fulfillment_id: fulfillmentId || null,
+        tracking_number: trackingNumber || null,
+        carrier: carrier || null,
+        result: "error",
+        idempotency_key: idempotencyKey,
+        error: err?.response?.data || err?.message || String(err),
+        payload: fulfillment,
+      });
+    } finally {
+      unlockId(lockKey);
+    }
+  })();
+}
+
+app.post("/webhook/fulfillments-update", handleFulfillmentsUpdateWebhook);
+app.post("/webhook/fulfillments/update", handleFulfillmentsUpdateWebhook);
+
+// --- Refunds/Create (Store Credit Only) ---
+// Shopify refunds/create is the ONLY reliable trigger.
+// Only notify when refund.transactions includes a successful store_credit refund transaction.
+async function handleRefundsCreateWebhook(req, res) {
+  const allowUnverified =
+    String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
+    "true";
+
+  const topic = (req.get("X-Shopify-Topic") || "").trim();
+  const shopDomain = (req.get("X-Shopify-Shop-Domain") || "").trim();
+
+  if (topic && topic !== "refunds/create") {
+    res.status(200).send("OK");
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "ignored",
+      reason: "wrong_topic",
+      topic,
+      shop_domain: shopDomain || null,
+    });
+    return;
+  }
+
+  if (
+    process.env.SHOPIFY_DOMAIN &&
+    shopDomain &&
+    shopDomain !== process.env.SHOPIFY_DOMAIN
+  ) {
+    res.status(200).send("OK");
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "ignored",
+      reason: "wrong_shop_domain",
+      topic: topic || null,
+      shop_domain: shopDomain,
+      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
+    });
+    return;
+  }
+
+  if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "rejected",
+      reason: "invalid_hmac",
+      topic: topic || null,
+      shop_domain: shopDomain || null,
+    });
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  // Always acknowledge quickly to Shopify
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+  const refund = payload.refund || payload;
+
+  const refundId = refund?.id;
+  const orderId = refund?.order_id;
+
+  const { matches, amount, currency } = computeStoreCreditRefundAmount(refund);
+  if (!matches.length || amount <= 0) {
+    const gateways = Array.isArray(refund?.transactions)
+      ? refund.transactions
+          .map((t) => (t ? String(t.gateway || "") : ""))
+          .filter(Boolean)
+      : [];
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "ignored",
+      reason: "not_store_credit",
+      refund_id: refundId || null,
+      order_id: orderId || null,
+      store_credit_transactions: matches.length,
+      gateways,
+      payload: refund,
+    });
+    return;
+  }
+
+  if (!refundId) {
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "error",
+      reason: "missing_refund_id",
+      order_id: orderId || null,
+      payload: refund,
+    });
+    return;
+  }
+
+  if (hasStoreCreditRefundBeenNotified(refundId)) {
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "ignored",
+      reason: "already_notified",
+      refund_id: refundId,
+      order_id: orderId || null,
+      amount,
+      currency,
+    });
+    return;
+  }
+
+  const lockKey = `store_credit_refund:${refundId}`;
+  if (!lockId(lockKey)) {
+    appendJsonlLog(storeCreditRefundWebhookLogFile, {
+      event: "refunds/create",
+      result: "ignored",
+      reason: "locked",
+      refund_id: refundId,
+      order_id: orderId || null,
+      amount,
+      currency,
+    });
+    return;
+  }
+
+  (async () => {
+    try {
+      if (hasStoreCreditRefundBeenNotified(refundId)) return;
+
+      let order = null;
+      if (orderId) {
+        try {
+          const or = await client.get({ path: `orders/${orderId}` });
+          order = or?.body?.order || null;
+        } catch (err) {
+          // will log below
+        }
+      }
+
+      if (!order) {
+        appendJsonlLog(storeCreditRefundWebhookLogFile, {
+          event: "refunds/create",
+          result: "error",
+          reason: "order_lookup_failed",
+          refund_id: refundId,
+          order_id: orderId || null,
+          amount,
+          currency,
+          payload: refund,
+        });
+        return;
+      }
+
+      const result = await sendStoreCreditRefundNotification({
+        order,
+        refund,
+        amount,
+        currency,
+      });
+
+      markStoreCreditRefundNotified(refundId);
+
+      appendJsonlLog(storeCreditRefundWebhookLogFile, {
+        event: "refunds/create",
+        result: "notified",
+        refund_id: refundId,
+        order_id: orderId || null,
+        amount,
+        currency,
+        notification: result,
+        payload: refund,
+      });
+    } catch (err) {
+      appendJsonlLog(storeCreditRefundWebhookLogFile, {
+        event: "refunds/create",
+        result: "error",
+        refund_id: refundId,
+        order_id: orderId || null,
+        amount,
+        currency,
+        error: err?.response?.data || err?.message || String(err),
+        payload: refund,
+      });
+    } finally {
+      unlockId(lockKey);
+    }
+  })();
+}
+
+app.post("/webhook/refunds-create", handleRefundsCreateWebhook);
+app.post("/webhook/refunds/create", handleRefundsCreateWebhook);
+
 // --- Order Cancellation ---
 app.post("/webhook/order-cancellation", (req, res) => {
   res.status(200).send("Order cancellation webhook received");
@@ -1429,11 +2413,14 @@ app.post("/webhook/order-cancellation", (req, res) => {
   const orderId = order?.id || order?.order_id;
 
   if (!orderId) {
-    console.log("Order cancellation webhook received with no order id. Skipping.");
+    console.log(
+      "Order cancellation webhook received with no order id. Skipping.",
+    );
     return;
   }
 
-  global.__processedCancellations = global.__processedCancellations || new Set();
+  global.__processedCancellations =
+    global.__processedCancellations || new Set();
   if (global.__processedCancellations.has(String(orderId))) {
     console.log(`Order cancellation ${orderId} already processed`);
     return;
@@ -1441,7 +2428,9 @@ app.post("/webhook/order-cancellation", (req, res) => {
   global.__processedCancellations.add(String(orderId));
   (async () => {
     try {
-      console.log(`Processing cancellation for order ${orderId} (sending WhatsApp)`);
+      console.log(
+        `Processing cancellation for order ${orderId} (sending WhatsApp)`,
+      );
 
       // Use provided payload; fetch full order only to enrich message if available
       let fullOrder = order;
@@ -1455,14 +2444,19 @@ app.post("/webhook/order-cancellation", (req, res) => {
       const customer = fullOrder.customer || {};
       const shipping = fullOrder.shipping_address || {};
       const name = shipping.first_name || customer.first_name || "Customer";
-      const orderName = fullOrder.name ? fullOrder.name.replace("#", "") : String(orderId);
+      const orderName = fullOrder.name
+        ? fullOrder.name.replace("#", "")
+        : String(orderId);
       const amount = fullOrder.total_price || fullOrder.subtotal_price || "0";
 
       const countryCode =
-        shipping?.country_code || fullOrder?.billing_address?.country_code || "IN";
+        shipping?.country_code ||
+        fullOrder?.billing_address?.country_code ||
+        "IN";
       const dialCode = getDialCode(countryCode) || "+91";
 
-      const rawPhone = shipping.phone || customer.phone || fullOrder.phone || "";
+      const rawPhone =
+        shipping.phone || customer.phone || fullOrder.phone || "";
       const cleanedPhone = rawPhone.replace(/\D/g, "").slice(-10);
       const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
@@ -1479,12 +2473,21 @@ app.post("/webhook/order-cancellation", (req, res) => {
 
       try {
         const resp = await sendDoubleTickTemplateMessage(payload);
-        console.log(`Order cancellation WhatsApp sent for order ${orderId}:`, resp.data || "(no body)");
+        console.log(
+          `Order cancellation WhatsApp sent for order ${orderId}:`,
+          resp.data || "(no body)",
+        );
       } catch (err) {
-        console.error("Failed to send order cancellation WhatsApp:", err.response?.data || err.message);
+        console.error(
+          "Failed to send order cancellation WhatsApp:",
+          err.response?.data || err.message,
+        );
       }
     } catch (err) {
-      console.error("Unexpected error processing order cancellation:", err?.message);
+      console.error(
+        "Unexpected error processing order cancellation:",
+        err?.message,
+      );
     }
   })();
 });
@@ -1606,7 +2609,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
       return candidates.some(
         (cand) =>
           // either full target is substring, or all tokens appear
-          cand.includes(targetName) || tokens.every((t) => cand.includes(t))
+          cand.includes(targetName) || tokens.every((t) => cand.includes(t)),
       );
     };
 
@@ -1622,7 +2625,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
 
       let orders = resp.body.orders || [];
       let matchedByPhone = orders.filter((o) =>
-        extractPhones(o).some((p) => p === target)
+        extractPhones(o).some((p) => p === target),
       );
 
       // Fallback: if no recent orders match by phone, search customers by phone and fetch their orders
@@ -1670,7 +2673,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
           }
           orders = allOrders;
           matchedByPhone = orders.filter((o) =>
-            extractPhones(o).some((p) => p === target)
+            extractPhones(o).some((p) => p === target),
           );
         }
       }
@@ -1683,7 +2686,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
       }
 
       const matchedFinal = matchedByPhone.filter((o) =>
-        nameMatches(o, targetName)
+        nameMatches(o, targetName),
       );
 
       if (!matchedFinal.length) {
@@ -1720,7 +2723,7 @@ app.get("/order-tracking", corsForOrderTracking, async (req, res) => {
     if (order && !order_id) {
       const resp = await client.get({
         path: "orders",
-        query: { name: `#${order.replace("#", "")}`, limit: 1, status: "any" },
+        query: { name: `${order.replace("#", "")}`, limit: 1, status: "any" },
       });
       const found = resp.body.orders?.[0];
       if (!found) {
@@ -1757,11 +2760,19 @@ app.post("/webhook/refund-processed", async (req, res) => {
   const body = req.body || {};
 
   // Normalize payload shapes (Razorpay: { payload: { refund: { entity }, payment: { entity } } })
-  const refundEntity = body.payload?.refund?.entity || body.refund?.entity || body.refund || body;
-  const paymentEntity = body.payload?.payment?.entity || body.payment?.entity || body.payment || null;
+  const refundEntity =
+    body.payload?.refund?.entity || body.refund?.entity || body.refund || body;
+  const paymentEntity =
+    body.payload?.payment?.entity ||
+    body.payment?.entity ||
+    body.payment ||
+    null;
 
   try {
-    const refundId = refundEntity?.id || refundEntity?.refund_id || JSON.stringify(refundEntity).slice(0, 200);
+    const refundId =
+      refundEntity?.id ||
+      refundEntity?.refund_id ||
+      JSON.stringify(refundEntity).slice(0, 200);
     global.__processedRefunds = global.__processedRefunds || new Set();
     if (global.__processedRefunds.has(refundId)) {
       console.log("Refund already processed:", refundId);
@@ -1772,21 +2783,34 @@ app.post("/webhook/refund-processed", async (req, res) => {
     (async () => {
       try {
         // Amount (Razorpay amounts are in paise)
-        const rawAmount = refundEntity?.amount || refundEntity?.amount_refunded || 0;
-        const currency = (refundEntity?.currency || paymentEntity?.currency || "INR").toString();
+        const rawAmount =
+          refundEntity?.amount || refundEntity?.amount_refunded || 0;
+        const currency = (
+          refundEntity?.currency ||
+          paymentEntity?.currency ||
+          "INR"
+        ).toString();
         const formatAmount = (a, cur) => {
           if (typeof a === "number") {
             if (cur && cur.toUpperCase() === "INR") return (a / 100).toFixed(2);
             return a.toFixed(2);
           }
           const n = Number(a);
-          if (!isNaN(n)) return cur && cur.toUpperCase() === "INR" ? (n / 100).toFixed(2) : n.toFixed(2);
+          if (!isNaN(n))
+            return cur && cur.toUpperCase() === "INR"
+              ? (n / 100).toFixed(2)
+              : n.toFixed(2);
           return "0";
         };
         const amount = formatAmount(rawAmount, currency);
 
         // Extract phone (prefer payment.contact)
-        const rawPhone = (paymentEntity?.contact || refundEntity?.contact || refundEntity?.notes?.contact || "").toString();
+        const rawPhone = (
+          paymentEntity?.contact ||
+          refundEntity?.contact ||
+          refundEntity?.notes?.contact ||
+          ""
+        ).toString();
         const cleanedPhone = rawPhone.replace(/\D/g, "").slice(-10);
         const countryCode = "IN";
         const dialCode = getDialCode(countryCode) || "+91";
@@ -1794,7 +2818,10 @@ app.post("/webhook/refund-processed", async (req, res) => {
 
         // Resolve Shopify order: direct id or search by phone/email
         let shopifyOrder = null;
-        const possibleOrderId = paymentEntity?.order_id || refundEntity?.order_id || refundEntity?.order_number;
+        const possibleOrderId =
+          paymentEntity?.order_id ||
+          refundEntity?.order_id ||
+          refundEntity?.order_number;
         if (possibleOrderId && /^[0-9]+$/.test(String(possibleOrderId))) {
           try {
             const or = await client.get({ path: `orders/${possibleOrderId}` });
@@ -1808,12 +2835,19 @@ app.post("/webhook/refund-processed", async (req, res) => {
           try {
             let resp = null;
             if (cleanedPhone) {
-              resp = await client.get({ path: "orders", query: { status: "any", limit: 1, phone: cleanedPhone } });
+              resp = await client.get({
+                path: "orders",
+                query: { status: "any", limit: 1, phone: cleanedPhone },
+              });
             }
             if ((!resp || !resp.body?.orders?.length) && paymentEntity?.email) {
-              resp = await client.get({ path: "orders", query: { status: "any", limit: 1, email: paymentEntity.email } });
+              resp = await client.get({
+                path: "orders",
+                query: { status: "any", limit: 1, email: paymentEntity.email },
+              });
             }
-            if (resp && resp.body?.orders?.length) shopifyOrder = resp.body.orders[0];
+            if (resp && resp.body?.orders?.length)
+              shopifyOrder = resp.body.orders[0];
           } catch (err) {
             // ignore
           }
@@ -1823,7 +2857,12 @@ app.post("/webhook/refund-processed", async (req, res) => {
         // const name = shopifyOrder?.shipping_address?.first_name || shopifyOrder?.customer?.first_name || refundEntity?.notes?.comment || "Customer";
 
         // Refund template expects: {{1}} = amount, {{2}} = refund method (capitalized)
-        const rawMethod = (paymentEntity?.method || refundEntity?.method || paymentEntity?.payment_method || "").toString();
+        const rawMethod = (
+          paymentEntity?.method ||
+          refundEntity?.method ||
+          paymentEntity?.payment_method ||
+          ""
+        ).toString();
         const method = rawMethod
           ? rawMethod.toLowerCase().replace(/(^|\s)\S/g, (t) => t.toUpperCase())
           : "";
@@ -1832,7 +2871,6 @@ app.post("/webhook/refund-processed", async (req, res) => {
           to: phoneNumber,
           from: "+919136524727",
           templateName:
-            process.env.DT_TEMPLATE_REFUND ||
             process.env.RP_TEMPLATE_NAME ||
             "kaj_refund_processed_v1",
           language: process.env.DT_LANGUAGE || "en",
@@ -1843,10 +2881,16 @@ app.post("/webhook/refund-processed", async (req, res) => {
           const r = await sendDoubleTickTemplateMessage(aiPayload);
           console.log("Refund message sent:", r.data || "(no body)");
         } catch (err) {
-          console.error("Failed to send refund message:", err?.response?.data || err.message);
+          console.error(
+            "Failed to send refund message:",
+            err?.response?.data || err.message,
+          );
         }
       } catch (err) {
-        console.error("Unexpected error processing refund webhook:", err?.message || err);
+        console.error(
+          "Unexpected error processing refund webhook:",
+          err?.message || err,
+        );
       }
     })();
   } catch (err) {
@@ -1858,4 +2902,34 @@ app.post("/webhook/refund-processed", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Shopify webhook server running on port ${PORT}`);
+
+  // --- Review message scheduler (no-cron) ---
+  // Sends `kaj_order_review_v2` once per fulfillment after a delay (default: 1 minute).
+  // Disable with REVIEW_SCHEDULER_ENABLED=false
+  const schedulerEnabled =
+    String(process.env.REVIEW_SCHEDULER_ENABLED || "true").toLowerCase() !==
+    "false";
+
+  const hasReviewUrlConfig = Boolean(
+    String(process.env.REVIEW_BUTTON_URL_TEMPLATE || "").trim() ||
+      String(process.env.REVIEW_BUTTON_URL || "").trim(),
+  );
+
+  if (schedulerEnabled && !hasReviewUrlConfig) {
+    console.warn(
+      "Review scheduler is enabled but REVIEW_BUTTON_URL/REVIEW_BUTTON_URL_TEMPLATE is missing; review messages will fail to send.",
+    );
+  }
+
+  const intervalMs =
+    Number(process.env.REVIEW_SCHEDULER_INTERVAL_MS) || 30 * 1000;
+
+  // Run shortly after boot, then periodically.
+  setTimeout(() => {
+    runReviewSchedulerOnce().catch(() => {});
+  }, 30 * 1000);
+
+  setInterval(() => {
+    runReviewSchedulerOnce().catch(() => {});
+  }, intervalMs);
 });
