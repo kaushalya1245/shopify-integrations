@@ -1815,7 +1815,7 @@ function parseDateMs(value) {
 
 function getReviewDelayMs() {
   const parsedDelayMs = Number(process.env.REVIEW_DELAY_MS);
-  return Number.isFinite(parsedDelayMs) ? parsedDelayMs : 1 * 24 * 60 * 60 * 1000;
+  return Number.isFinite(parsedDelayMs) ? parsedDelayMs : 4 * 24 * 60 * 60 * 1000;
 }
 
 async function attemptSendReviewForFulfillmentId(fulfillmentId) {
