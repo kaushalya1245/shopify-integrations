@@ -584,7 +584,8 @@ async function handleAbandonedCheckoutMessage(checkout) {
   if (
     !checkout.email &&
     !checkout?.phone &&
-    !checkout.shipping_address?.phone
+    !checkout.shipping_address?.phone &&
+    !checkout.billing_address?.phone
   ) {
     console.log(
       "Skipping incomplete checkout for sending message (missing contact info)",
@@ -592,7 +593,10 @@ async function handleAbandonedCheckoutMessage(checkout) {
     return;
   }
 
-  const name = checkout.shipping_address?.first_name || "Customer";
+  const name =
+    checkout.shipping_address?.first_name ||
+    checkout.billing_address?.first_name ||
+    "Customer";
   const amount = checkout.total_price || "0";
   const abandonedCheckoutUrl = `checkouts/cn/${checkout.cart_token}/information`;
   const countryCode =
@@ -635,7 +639,11 @@ async function handleAbandonedCheckoutMessage(checkout) {
 
   const dialCode = getDialCode(countryCode);
 
-  let rawPhone = checkout?.shipping_address?.phone || checkout?.phone || "";
+  let rawPhone =
+    checkout?.shipping_address?.phone ||
+    checkout?.billing_address?.phone ||
+    checkout?.phone ||
+    "";
   let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
   const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
@@ -970,7 +978,8 @@ async function verifyCheckout(checkout) {
   if (
     !checkout?.email &&
     !checkout?.phone &&
-    !checkout?.shipping_address?.phone
+    !checkout?.shipping_address?.phone &&
+    !checkout?.billing_address?.phone
   ) {
     console.log("Skipping incomplete checkout (missing contact info)");
     return;
@@ -978,7 +987,11 @@ async function verifyCheckout(checkout) {
 
   let orders = [];
   try {
-    const phone = checkout?.shipping_address?.phone || checkout?.phone;
+    const phone =
+      checkout?.shipping_address?.phone ||
+      checkout?.billing_address?.phone ||
+      checkout?.phone;
+    const phoneLast10 = extractDigitsPhone(phone).slice(-10);
     const email = checkout.email;
     const res = await client.get({
       path: "orders",
@@ -1022,10 +1035,14 @@ async function verifyCheckout(checkout) {
             o?.customer?.phone,
             o?.customer?.default_address?.phone,
             o?.shipping_address?.phone,
+            o?.billing_address?.phone,
           ].filter(Boolean);
 
           const phoneMatches =
-            phone && orderPhones.some((p) => p.includes(phone));
+            phoneLast10 &&
+            orderPhones
+              .map((p) => extractDigitsPhone(p).slice(-10))
+              .some((p10) => p10 && p10 === phoneLast10);
 
           const priceMatches =
             Number(o.total_price) === Number(checkout.total_price);
@@ -1085,16 +1102,19 @@ async function verifyCheckout(checkout) {
           if (payment.status !== "captured") return false;
           if (!payment?.notes?.cancelUrl) return false;
 
-          const perfectPhoneDigits = payment?.contact
-            .replace(/\s+/g, "")
-            .slice(-10);
+          const perfectPhoneDigits = extractDigitsPhone(payment?.contact).slice(-10);
           const perfectAmount = payment.amount / 100;
 
+          const checkoutPhoneDigits = extractDigitsPhone(
+            checkout?.shipping_address?.phone ||
+              checkout?.billing_address?.phone ||
+              checkout?.phone,
+          ).slice(-10);
+
           const matchesPhoneAndAmount =
-            (perfectPhoneDigits === checkout?.shipping_address?.phone &&
-              perfectAmount === totalCheckoutPrice) ||
-            (payment.contact === checkout?.phone &&
-              perfectAmount === totalCheckoutPrice);
+            checkoutPhoneDigits &&
+            perfectPhoneDigits === checkoutPhoneDigits &&
+            perfectAmount === totalCheckoutPrice;
 
           const matchesCartToken = payment.notes.cancelUrl.includes(
             checkout?.cart_token,
@@ -1177,7 +1197,11 @@ setInterval(() => {
 
       const shipping = checkout.shipping_address || {};
       const email = checkout.email || "";
-      const rawPhone = shipping?.phone || checkout.phone || "";
+      const rawPhone =
+        shipping?.phone ||
+        checkout?.billing_address?.phone ||
+        checkout.phone ||
+        "";
       const hasValidPhone = rawPhone.replace(/\D/g, "").length >= 10;
 
       const hasContactInfo = hasValidPhone || email;
@@ -1355,6 +1379,7 @@ async function sendOrderConfirmation(order) {
   try {
     const customer = order.customer || {};
     const shippingAddress = order.shipping_address || {};
+    const billingAddress = order.billing_address || {};
     const name =
       shippingAddress.first_name || customer.first_name || "Customer";
     const orderName = order.name.replace("#", "") || "Unknown Order";
@@ -1367,7 +1392,13 @@ async function sendOrderConfirmation(order) {
 
     const dialCode = getDialCode(countryCode);
 
-    let rawPhone = shippingAddress.phone || customer.phone || "";
+    let rawPhone =
+      shippingAddress.phone ||
+      billingAddress.phone ||
+      order?.phone ||
+      customer.phone ||
+      customer?.default_address?.phone ||
+      "";
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
     const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
@@ -1599,11 +1630,14 @@ async function sendFulfillmentMessage(fulfillment) {
     const orderName =
       fulfillment.name.replace("#", "").split(".")[0] || "Unknown Order";
     const trackingNumber = fulfillment.tracking_number || "Unknown fulfillment";
+    let amount = "0";
+    let orderData = null;
     try {
       const order = await client.get({
         path: `orders/${orderId}`,
       });
-      amount = order.body.order.total_price || "0";
+      orderData = order?.body?.order || null;
+      amount = orderData?.total_price || "0";
     } catch (orderError) {
       console.error("Failed to fetch order details:", orderError);
     } finally {
@@ -1614,7 +1648,14 @@ async function sendFulfillmentMessage(fulfillment) {
 
     const dialCode = getDialCode(countryCode);
 
-    let rawPhone = customer.phone || "";
+    let rawPhone =
+      customer.phone ||
+      orderData?.shipping_address?.phone ||
+      orderData?.billing_address?.phone ||
+      orderData?.phone ||
+      orderData?.customer?.phone ||
+      orderData?.customer?.default_address?.phone ||
+      "";
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
     const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
@@ -2456,7 +2497,12 @@ app.post("/webhook/order-cancellation", (req, res) => {
       const dialCode = getDialCode(countryCode) || "+91";
 
       const rawPhone =
-        shipping.phone || customer.phone || fullOrder.phone || "";
+        shipping.phone ||
+        fullOrder?.billing_address?.phone ||
+        customer.phone ||
+        customer?.default_address?.phone ||
+        fullOrder.phone ||
+        "";
       const cleanedPhone = rawPhone.replace(/\D/g, "").slice(-10);
       const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
