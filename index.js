@@ -82,6 +82,27 @@ const session = new Session({
 });
 
 const client = new shopify.clients.Rest({ session });
+const gqlClient = new shopify.clients.Graphql({ session });
+
+async function fetchOrderDisplayFulfillmentStatus(orderId) {
+  if (!orderId) return null;
+  const gid = `gid://shopify/Order/${String(orderId)}`;
+  const query = `query ($id: ID!) {
+    order(id: $id) {
+      id
+      displayFulfillmentStatus
+    }
+  }`;
+
+  const resp = await gqlClient.query({
+    data: {
+      query,
+      variables: { id: gid },
+    },
+  });
+
+  return resp?.body?.data?.order?.displayFulfillmentStatus || null;
+}
 
 const dataFiles = {
   checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
@@ -2554,6 +2575,187 @@ app.post(
 app.post(
   "/webhook/fulfillments-update-pickup",
   handleFulfillmentsUpdatePickupReadyWebhook,
+);
+
+// --- Orders/Updated (Local Pickup Ready For Pickup) ---
+// Production-safe path: detect READY_FOR_PICKUP from order.displayFulfillmentStatus.
+async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
+  const allowUnverified =
+    String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
+    "true";
+
+  const topic = (req.get("X-Shopify-Topic") || "").trim();
+  const shopDomain = (req.get("X-Shopify-Shop-Domain") || "").trim();
+
+  if (topic && topic !== "orders/updated") {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "wrong_topic",
+      topic,
+      shop_domain: shopDomain || null,
+    });
+    return;
+  }
+
+  if (
+    process.env.SHOPIFY_DOMAIN &&
+    shopDomain &&
+    shopDomain !== process.env.SHOPIFY_DOMAIN
+  ) {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "wrong_shop_domain",
+      topic: topic || null,
+      shop_domain: shopDomain,
+      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
+    });
+    return;
+  }
+
+  if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "rejected",
+      reason: "invalid_hmac",
+      topic: topic || null,
+      shop_domain: shopDomain || null,
+    });
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+  const order = payload.order || payload;
+  const orderId = order?.id || payload?.order_id;
+  if (!orderId) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "error",
+      reason: "missing_order_id",
+      payload: order,
+    });
+    return;
+  }
+
+  const shippingLines = Array.isArray(order?.shipping_lines)
+    ? order.shipping_lines
+    : [];
+  const hasPickupShipping = shippingLines.some((sl) => {
+    const code = String(sl?.code || "").toLowerCase();
+    const title = String(sl?.title || "").toLowerCase();
+    return code === "pickup" || title.includes("pickup");
+  });
+  if (!hasPickupShipping) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "not_pickup_order",
+      order_id: orderId,
+    });
+    return;
+  }
+
+  const idempotencyKey = `order:${String(orderId)}:ready_for_pickup`;
+  if (hasPickupReadyBeenNotified(idempotencyKey)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "already_notified",
+      order_id: orderId,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  const lockKey = `pickup_ready_order:${idempotencyKey}`;
+  if (!lockId(lockKey)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "locked",
+      order_id: orderId,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  (async () => {
+    try {
+      if (hasPickupReadyBeenNotified(idempotencyKey)) return;
+
+      const displayStatus = await fetchOrderDisplayFulfillmentStatus(orderId);
+      const normalized = String(displayStatus || "").toUpperCase();
+      if (normalized !== "READY_FOR_PICKUP") {
+        appendJsonlLog(pickupReadyWebhookLogFile, {
+          event: "orders/updated",
+          subtype: "pickup_ready",
+          result: "ignored",
+          reason: "not_ready_for_pickup",
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          display_fulfillment_status: displayStatus,
+        });
+        return;
+      }
+
+      const result = await sendPickupReadyNotification({
+        order,
+        fulfillmentOrder: null,
+      });
+
+      markPickupReadyNotified(idempotencyKey);
+
+      appendJsonlLog(pickupReadyWebhookLogFile, {
+        event: "orders/updated",
+        subtype: "pickup_ready",
+        result: "notified",
+        order_id: orderId,
+        idempotency_key: idempotencyKey,
+        display_fulfillment_status: displayStatus,
+        notification: result,
+        payload: {
+          order_id: orderId,
+          shipping_lines: shippingLines.map((sl) => ({
+            code: sl?.code || null,
+            title: sl?.title || null,
+          })),
+        },
+      });
+    } catch (err) {
+      appendJsonlLog(pickupReadyWebhookLogFile, {
+        event: "orders/updated",
+        subtype: "pickup_ready",
+        result: err?.code === "NO_VALID_PHONE" ? "ignored" : "error",
+        reason: err?.code === "NO_VALID_PHONE" ? "no_valid_phone" : undefined,
+        order_id: orderId,
+        idempotency_key: idempotencyKey,
+        error: err?.response?.data || err?.message || String(err),
+      });
+    } finally {
+      unlockId(lockKey);
+    }
+  })();
+}
+
+app.post(
+  "/webhook/orders/updated-pickup",
+  handleOrdersUpdatedPickupReadyWebhook,
+);
+app.post(
+  "/webhook/orders-updated-pickup",
+  handleOrdersUpdatedPickupReadyWebhook,
 );
 
 // --- Fulfillment Orders/Line Items Prepared For Pickup ---

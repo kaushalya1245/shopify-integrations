@@ -83,6 +83,11 @@ async function main() {
       address: `${baseUrl}/webhook/refunds/create`,
     },
     {
+      // Production-safe local pickup ready-for-pickup detection
+      topic: "orders/updated",
+      address: `${baseUrl}/webhook/orders/updated-pickup`,
+    },
+    {
       // Admin label: "Fulfillment order line items are prepared for pickup"
       topic: "fulfillment_orders/line_items_prepared_for_pickup",
       address: `${baseUrl}/webhook/fulfillment_orders/line_items_prepared_for_pickup`,
