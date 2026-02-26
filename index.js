@@ -88,6 +88,7 @@ const dataFiles = {
   orders: path.resolve(__dirname, "processed-orders.json"),
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
   deliveries: path.resolve(__dirname, "processed-deliveries.json"),
+  pickupPrepared: path.resolve(__dirname, "processed-pickup-prepared.json"),
   deliveryReviewRecords: path.resolve(__dirname, "delivery-review-records.json"),
   deliveryReviewFulfillments: path.resolve(
     __dirname,
@@ -109,6 +110,11 @@ const deliveryWebhookLogFile = path.resolve(
 const storeCreditRefundWebhookLogFile = path.resolve(
   __dirname,
   "store-credit-refund-webhook-logs.jsonl",
+);
+
+const pickupPreparedWebhookLogFile = path.resolve(
+  __dirname,
+  "pickup-prepared-webhook-logs.jsonl",
 );
 
 const deliveryReviewLogFile = path.resolve(
@@ -1799,6 +1805,50 @@ async function sendDeliveryNotification(fulfillment) {
   };
 }
 
+async function sendPickupReadyNotification({ order, fulfillmentOrder }) {
+  const recipient = await resolveOrderRecipientForRefund(order);
+  if (!isLikelyValidWhatsAppNumberDigits(recipient.digits)) {
+    const err = new Error(
+      `No valid phone number found for pickup-ready notification (source=${recipient.source})`,
+    );
+    err.code = "NO_VALID_PHONE";
+    throw err;
+  }
+
+  const countryCode = recipient.countryCode || "IN";
+  const dialCode = getDialCode(countryCode) || "+91";
+  const cleanedPhone = recipient.digits.slice(-10);
+  const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+  const name = recipient.name || "Customer";
+  const orderName = order?.name
+    ? String(order.name).replace("#", "").split(".")[0]
+    : order?.id
+      ? String(order.id)
+      : "Unknown Order";
+
+  const fulfillmentOrderId = fulfillmentOrder?.id || null;
+  const payload = {
+    to: phoneNumberInternationalFormat,
+    templateName:
+      process.env.ORP_CAMPAIGN_NAME ||
+      process.env.PICKUP_READY_TEMPLATE_NAME ||
+      "kaj_order_ready_for_pickup_v1",
+    language: process.env.DT_LANGUAGE || "en",
+    bodyPlaceholders: [name, `${orderName}`],
+  };
+
+  const resp = await sendDoubleTickTemplateMessage(payload);
+  return {
+    ok: true,
+    fulfillmentOrderId,
+    orderId: order?.id || null,
+    orderName,
+    recipientSource: recipient.source,
+    providerResponse: resp?.data,
+  };
+}
+
 function hasDeliveryBeenNotified(key) {
   // Read from disk for safety across restarts/instances
   const set = loadSet(dataFiles.deliveries, "set");
@@ -1809,6 +1859,17 @@ function markDeliveryNotified(key) {
   const set = loadSet(dataFiles.deliveries, "set");
   set.add(String(key));
   fs.writeFileSync(dataFiles.deliveries, JSON.stringify(Array.from(set)));
+}
+
+function hasPickupPreparedBeenRecorded(key) {
+  const set = loadSet(dataFiles.pickupPrepared, "set");
+  return set.has(String(key));
+}
+
+function markPickupPreparedRecorded(key) {
+  const set = loadSet(dataFiles.pickupPrepared, "set");
+  set.add(String(key));
+  fs.writeFileSync(dataFiles.pickupPrepared, JSON.stringify(Array.from(set)));
 }
 
 function loadDeliveryReviewRecords() {
@@ -2259,6 +2320,194 @@ async function handleFulfillmentsUpdateWebhook(req, res) {
 
 app.post("/webhook/fulfillments-update", handleFulfillmentsUpdateWebhook);
 app.post("/webhook/fulfillments/update", handleFulfillmentsUpdateWebhook);
+
+// --- Fulfillment Orders/Line Items Prepared For Pickup ---
+// Admin label: "Fulfillment order line items are prepared for pickup"
+async function handleFulfillmentOrderLineItemsPreparedForPickupWebhook(req, res) {
+  const allowUnverified =
+    String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
+    "true";
+
+  const topic = (req.get("X-Shopify-Topic") || "").trim();
+  const shopDomain = (req.get("X-Shopify-Shop-Domain") || "").trim();
+  const expectedTopic = "fulfillment_orders/line_items_prepared_for_pickup";
+
+  if (topic && topic !== expectedTopic) {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "ignored",
+      reason: "wrong_topic",
+      topic,
+      shop_domain: shopDomain || null,
+    });
+    return;
+  }
+
+  if (
+    process.env.SHOPIFY_DOMAIN &&
+    shopDomain &&
+    shopDomain !== process.env.SHOPIFY_DOMAIN
+  ) {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "ignored",
+      reason: "wrong_shop_domain",
+      topic: topic || null,
+      shop_domain: shopDomain,
+      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
+    });
+    return;
+  }
+
+  if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "rejected",
+      reason: "invalid_hmac",
+      topic: topic || null,
+      shop_domain: shopDomain || null,
+    });
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  // Always acknowledge quickly to Shopify
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+
+  // REST webhook payloads for fulfillment_orders/* typically include fulfillment_order.
+  const fulfillmentOrder = payload.fulfillment_order || payload;
+  const fulfillmentOrderId =
+    fulfillmentOrder?.id || payload?.fulfillment_order_id || payload?.id;
+  const orderId = fulfillmentOrder?.order_id || payload?.order_id;
+
+  if (!fulfillmentOrderId) {
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "error",
+      reason: "missing_fulfillment_order_id",
+      order_id: orderId || null,
+      payload,
+    });
+    return;
+  }
+
+  const idempotencyKey = String(fulfillmentOrderId);
+  if (hasPickupPreparedBeenRecorded(idempotencyKey)) {
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "ignored",
+      reason: "already_recorded",
+      fulfillment_order_id: fulfillmentOrderId,
+      order_id: orderId || null,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  const lockKey = `pickup_prepared:${idempotencyKey}`;
+  if (!lockId(lockKey)) {
+    appendJsonlLog(pickupPreparedWebhookLogFile, {
+      event: expectedTopic,
+      result: "ignored",
+      reason: "locked",
+      fulfillment_order_id: fulfillmentOrderId,
+      order_id: orderId || null,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  (async () => {
+    try {
+      if (hasPickupPreparedBeenRecorded(idempotencyKey)) return;
+
+      if (!orderId) {
+        appendJsonlLog(pickupPreparedWebhookLogFile, {
+          event: expectedTopic,
+          result: "error",
+          reason: "missing_order_id",
+          fulfillment_order_id: fulfillmentOrderId,
+          idempotency_key: idempotencyKey,
+          payload: fulfillmentOrder,
+        });
+        return;
+      }
+
+      let order = null;
+      try {
+        const or = await client.get({ path: `orders/${orderId}` });
+        order = or?.body?.order || null;
+      } catch (err) {
+        appendJsonlLog(pickupPreparedWebhookLogFile, {
+          event: expectedTopic,
+          result: "error",
+          reason: "order_lookup_failed",
+          fulfillment_order_id: fulfillmentOrderId,
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          error: err?.response?.data || err?.message || String(err),
+          payload: fulfillmentOrder,
+        });
+        return;
+      }
+
+      if (!order) {
+        appendJsonlLog(pickupPreparedWebhookLogFile, {
+          event: expectedTopic,
+          result: "error",
+          reason: "order_missing",
+          fulfillment_order_id: fulfillmentOrderId,
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          payload: fulfillmentOrder,
+        });
+        return;
+      }
+
+      const result = await sendPickupReadyNotification({
+        order,
+        fulfillmentOrder,
+      });
+
+      markPickupPreparedRecorded(idempotencyKey);
+
+      appendJsonlLog(pickupPreparedWebhookLogFile, {
+        event: expectedTopic,
+        result: "notified",
+        fulfillment_order_id: fulfillmentOrderId,
+        order_id: orderId,
+        idempotency_key: idempotencyKey,
+        notification: result,
+        payload: fulfillmentOrder,
+      });
+    } catch (err) {
+      appendJsonlLog(pickupPreparedWebhookLogFile, {
+        event: expectedTopic,
+        result: err?.code === "NO_VALID_PHONE" ? "ignored" : "error",
+        reason: err?.code === "NO_VALID_PHONE" ? "no_valid_phone" : undefined,
+        fulfillment_order_id: fulfillmentOrderId,
+        order_id: orderId || null,
+        idempotency_key: idempotencyKey,
+        error: err?.response?.data || err?.message || String(err),
+        payload: fulfillmentOrder,
+      });
+    } finally {
+      unlockId(lockKey);
+    }
+  })();
+}
+
+app.post(
+  "/webhook/fulfillment_orders/line_items_prepared_for_pickup",
+  handleFulfillmentOrderLineItemsPreparedForPickupWebhook,
+);
+app.post(
+  "/webhook/fulfillment-orders-line-items-prepared-for-pickup",
+  handleFulfillmentOrderLineItemsPreparedForPickupWebhook,
+);
 
 // --- Refunds/Create (Store Credit Only) ---
 // Shopify refunds/create is the ONLY reliable trigger.
@@ -2943,6 +3192,8 @@ app.post("/webhook/refund-processed", async (req, res) => {
     console.error("Refund webhook handler error:", err?.message || err);
   }
 });
+
+
 
 // --- Start server ---
 const PORT = process.env.PORT || 3000;

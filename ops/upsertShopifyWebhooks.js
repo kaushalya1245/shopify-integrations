@@ -69,6 +69,11 @@ async function main() {
       topic: "refunds/create",
       address: `${baseUrl}/webhook/refunds/create`,
     },
+    {
+      // Admin label: "Fulfillment order line items are prepared for pickup"
+      topic: "fulfillment_orders/line_items_prepared_for_pickup",
+      address: `${baseUrl}/webhook/fulfillment_orders/line_items_prepared_for_pickup`,
+    },
   ];
 
   const resp = await client.get({ path: "webhooks", query: { limit: 250 } });
