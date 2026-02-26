@@ -1665,7 +1665,8 @@ async function sendFulfillmentMessage(fulfillment) {
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
     const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
-    const fulfillmentStatusURL = fulfillment.tracking_url;
+    // const fulfillmentStatusURL = fulfillment.tracking_url;
+    const fulfillmentStatusURL = "https://kaushalyaartjewellery.logisy.tech/track-order/";
 
     // Product image
     let imageUrl =
