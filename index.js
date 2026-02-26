@@ -89,6 +89,7 @@ const dataFiles = {
   fulfillments: path.resolve(__dirname, "processed-fulfillments.json"),
   deliveries: path.resolve(__dirname, "processed-deliveries.json"),
   pickupPrepared: path.resolve(__dirname, "processed-pickup-prepared.json"),
+  pickupReady: path.resolve(__dirname, "processed-pickup-ready.json"),
   deliveryReviewRecords: path.resolve(__dirname, "delivery-review-records.json"),
   deliveryReviewFulfillments: path.resolve(
     __dirname,
@@ -115,6 +116,11 @@ const storeCreditRefundWebhookLogFile = path.resolve(
 const pickupPreparedWebhookLogFile = path.resolve(
   __dirname,
   "pickup-prepared-webhook-logs.jsonl",
+);
+
+const pickupReadyWebhookLogFile = path.resolve(
+  __dirname,
+  "pickup-ready-webhook-logs.jsonl",
 );
 
 const deliveryReviewLogFile = path.resolve(
@@ -1873,6 +1879,17 @@ function markPickupPreparedRecorded(key) {
   fs.writeFileSync(dataFiles.pickupPrepared, JSON.stringify(Array.from(set)));
 }
 
+function hasPickupReadyBeenNotified(key) {
+  const set = loadSet(dataFiles.pickupReady, "set");
+  return set.has(String(key));
+}
+
+function markPickupReadyNotified(key) {
+  const set = loadSet(dataFiles.pickupReady, "set");
+  set.add(String(key));
+  fs.writeFileSync(dataFiles.pickupReady, JSON.stringify(Array.from(set)));
+}
+
 function loadDeliveryReviewRecords() {
   try {
     const parsed = JSON.parse(fs.readFileSync(dataFiles.deliveryReviewRecords, "utf8"));
@@ -2322,6 +2339,223 @@ async function handleFulfillmentsUpdateWebhook(req, res) {
 app.post("/webhook/fulfillments-update", handleFulfillmentsUpdateWebhook);
 app.post("/webhook/fulfillments/update", handleFulfillmentsUpdateWebhook);
 
+// --- Fulfillments/Update (Local Pickup Ready For Pickup) ---
+// This is intentionally separate from handleFulfillmentsUpdateWebhook to avoid changing
+// the existing delivery-detection behavior.
+async function handleFulfillmentsUpdatePickupReadyWebhook(req, res) {
+  const allowUnverified =
+    String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
+    "true";
+
+  const topic = (req.get("X-Shopify-Topic") || "").trim();
+  const shopDomain = (req.get("X-Shopify-Shop-Domain") || "").trim();
+
+  if (topic && topic !== "fulfillments/update") {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "wrong_topic",
+      topic,
+      shop_domain: shopDomain || null,
+    });
+    return;
+  }
+
+  if (
+    process.env.SHOPIFY_DOMAIN &&
+    shopDomain &&
+    shopDomain !== process.env.SHOPIFY_DOMAIN
+  ) {
+    res.status(200).send("OK");
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "wrong_shop_domain",
+      topic: topic || null,
+      shop_domain: shopDomain,
+      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
+    });
+    return;
+  }
+
+  if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "rejected",
+      reason: "invalid_hmac",
+      topic: topic || null,
+      shop_domain: shopDomain || null,
+    });
+    return res.status(401).send("Invalid webhook signature");
+  }
+
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+  const fulfillment = payload.fulfillment || payload;
+
+  const fulfillmentId = fulfillment?.id || payload?.id || null;
+  const orderId = fulfillment?.order_id || payload?.order_id || null;
+
+  const fulfillmentStatus = String(fulfillment?.status || "").toLowerCase();
+  const shipmentStatus = fulfillment?.shipment_status || payload?.shipment_status;
+  const trackingNumber = pickFirstTrackingNumber(fulfillment) || "";
+
+  const deliveryMethod = fulfillment?.delivery_method;
+  const deliveryMethodType =
+    typeof deliveryMethod === "string"
+      ? deliveryMethod
+      : deliveryMethod?.method_type || deliveryMethod?.type || "";
+
+  // Local pickup heuristic per Shopify behavior:
+  // - delivery_method == pickup
+  // - fulfillment status becomes success
+  // - typically no tracking and no shipment_status
+  const isPickup = String(deliveryMethodType || "").toLowerCase() === "pickup";
+  const isSuccess = fulfillmentStatus === "success" || fulfillmentStatus === "fulfilled";
+  const hasNoShipmentStatus = shipmentStatus === null || shipmentStatus === undefined || shipmentStatus === "";
+  const hasNoTracking = !trackingNumber;
+
+  if (!isPickup || !isSuccess || !hasNoShipmentStatus || !hasNoTracking) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "not_ready_for_pickup",
+      fulfillment_id: fulfillmentId,
+      order_id: orderId,
+      delivery_method: deliveryMethodType || null,
+      status: fulfillmentStatus || null,
+      shipment_status: shipmentStatus ?? null,
+      tracking_number: trackingNumber || null,
+    });
+    return;
+  }
+
+  if (!orderId) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "error",
+      reason: "missing_order_id",
+      fulfillment_id: fulfillmentId,
+      payload: fulfillment,
+    });
+    return;
+  }
+
+  const idempotencyKey = fulfillmentId ? String(fulfillmentId) : String(orderId);
+  if (hasPickupReadyBeenNotified(idempotencyKey)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "already_notified",
+      fulfillment_id: fulfillmentId,
+      order_id: orderId,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  const lockKey = `pickup_ready:${idempotencyKey}`;
+  if (!lockId(lockKey)) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "fulfillments/update",
+      subtype: "pickup_ready",
+      result: "ignored",
+      reason: "locked",
+      fulfillment_id: fulfillmentId,
+      order_id: orderId,
+      idempotency_key: idempotencyKey,
+    });
+    return;
+  }
+
+  (async () => {
+    try {
+      if (hasPickupReadyBeenNotified(idempotencyKey)) return;
+
+      const or = await client.get({ path: `orders/${orderId}` });
+      const order = or?.body?.order || null;
+      if (!order) {
+        appendJsonlLog(pickupReadyWebhookLogFile, {
+          event: "fulfillments/update",
+          subtype: "pickup_ready",
+          result: "error",
+          reason: "order_missing",
+          fulfillment_id: fulfillmentId,
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          payload: fulfillment,
+        });
+        return;
+      }
+
+      // Confirm order fulfillment_status is fulfilled (per your requirement)
+      const orderFulfillmentStatus = String(order?.fulfillment_status || "").toLowerCase();
+      if (orderFulfillmentStatus !== "fulfilled") {
+        appendJsonlLog(pickupReadyWebhookLogFile, {
+          event: "fulfillments/update",
+          subtype: "pickup_ready",
+          result: "ignored",
+          reason: "order_not_fulfilled",
+          fulfillment_id: fulfillmentId,
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          order_fulfillment_status: orderFulfillmentStatus || null,
+        });
+        return;
+      }
+
+      const result = await sendPickupReadyNotification({
+        order,
+        fulfillmentOrder: fulfillmentId ? { id: fulfillmentId } : null,
+      });
+
+      markPickupReadyNotified(idempotencyKey);
+
+      appendJsonlLog(pickupReadyWebhookLogFile, {
+        event: "fulfillments/update",
+        subtype: "pickup_ready",
+        result: "notified",
+        fulfillment_id: fulfillmentId,
+        order_id: orderId,
+        idempotency_key: idempotencyKey,
+        notification: result,
+        payload: fulfillment,
+      });
+    } catch (err) {
+      appendJsonlLog(pickupReadyWebhookLogFile, {
+        event: "fulfillments/update",
+        subtype: "pickup_ready",
+        result: err?.code === "NO_VALID_PHONE" ? "ignored" : "error",
+        reason: err?.code === "NO_VALID_PHONE" ? "no_valid_phone" : undefined,
+        fulfillment_id: fulfillmentId,
+        order_id: orderId,
+        idempotency_key: idempotencyKey,
+        error: err?.response?.data || err?.message || String(err),
+        payload: fulfillment,
+      });
+    } finally {
+      unlockId(lockKey);
+    }
+  })();
+}
+
+app.post(
+  "/webhook/fulfillments/update-pickup",
+  handleFulfillmentsUpdatePickupReadyWebhook,
+);
+app.post(
+  "/webhook/fulfillments-update-pickup",
+  handleFulfillmentsUpdatePickupReadyWebhook,
+);
+
 // --- Fulfillment Orders/Line Items Prepared For Pickup ---
 // Admin label: "Fulfillment order line items are prepared for pickup"
 async function handleFulfillmentOrderLineItemsPreparedForPickupWebhook(req, res) {
@@ -2424,6 +2658,25 @@ async function handleFulfillmentOrderLineItemsPreparedForPickupWebhook(req, res)
   (async () => {
     try {
       if (hasPickupPreparedBeenRecorded(idempotencyKey)) return;
+
+      const sendEnabled =
+        String(process.env.PICKUP_PREPARED_WEBHOOK_SEND_ENABLED || "").toLowerCase() ===
+        "true";
+
+      // Default behavior: record/log only. Enable sending explicitly if you rely on this topic.
+      if (!sendEnabled) {
+        markPickupPreparedRecorded(idempotencyKey);
+        appendJsonlLog(pickupPreparedWebhookLogFile, {
+          event: expectedTopic,
+          result: "recorded",
+          reason: "send_disabled",
+          fulfillment_order_id: fulfillmentOrderId,
+          order_id: orderId || null,
+          idempotency_key: idempotencyKey,
+          payload: fulfillmentOrder,
+        });
+        return;
+      }
 
       if (!orderId) {
         appendJsonlLog(pickupPreparedWebhookLogFile, {

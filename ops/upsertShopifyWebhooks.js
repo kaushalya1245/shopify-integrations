@@ -60,10 +60,23 @@ async function main() {
 
   const client = new shopify.clients.Rest({ session });
 
+  const addressPath = (addr) => {
+    try {
+      return new URL(String(addr)).pathname;
+    } catch {
+      return String(addr || "");
+    }
+  };
+
   const desired = [
     {
       topic: "fulfillments/update",
       address: `${baseUrl}/webhook/fulfillments/update`,
+    },
+    {
+      // Local pickup: detect "Ready for pickup" from fulfillments/update
+      topic: "fulfillments/update",
+      address: `${baseUrl}/webhook/fulfillments/update-pickup`,
     },
     {
       topic: "refunds/create",
@@ -90,19 +103,21 @@ async function main() {
       continue;
     }
 
-    // If topic exists but ngrok/public URL changed, update the existing webhook
-    const byTopic = existing.find((w) => w.topic === d.topic);
-    if (byTopic) {
+    // If the route already exists for this topic but public base URL changed, update that one.
+    const byTopicAndPath = existing.find(
+      (w) => w.topic === d.topic && addressPath(w.address) === addressPath(d.address),
+    );
+    if (byTopicAndPath) {
       const updated = await client.put({
-        path: `webhooks/${byTopic.id}`,
-        data: { webhook: { id: byTopic.id, address: d.address } },
+        path: `webhooks/${byTopicAndPath.id}`,
+        data: { webhook: { id: byTopicAndPath.id, address: d.address } },
         type: "application/json",
       });
 
       console.log("♻️ Webhook updated", {
         topic: d.topic,
-        id: byTopic.id,
-        from: byTopic.address,
+        id: byTopicAndPath.id,
+        from: byTopicAndPath.address,
         to: d.address,
         resultId: updated?.body?.webhook?.id,
       });
