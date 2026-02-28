@@ -104,6 +104,35 @@ async function fetchOrderDisplayFulfillmentStatus(orderId) {
   return resp?.body?.data?.order?.displayFulfillmentStatus || null;
 }
 
+async function fetchFulfillmentOrders(orderId) {
+  if (!orderId) return [];
+
+  try {
+    const resp = await client.get({
+      path: `orders/${String(orderId)}/fulfillment_orders`,
+    });
+
+    const body = resp?.body || {};
+    const list =
+      body.fulfillment_orders ||
+      body.fulfillmentOrders ||
+      body.fulfillment_orders_v2 ||
+      [];
+
+    return Array.isArray(list) ? list : [];
+  } catch (err) {
+    appendJsonlLog(pickupReadyWebhookLogFile, {
+      event: "orders/updated",
+      subtype: "pickup_ready",
+      result: "error",
+      reason: "fulfillment_orders_fetch_failed",
+      order_id: orderId,
+      error: err?.response?.body || err?.response?.data || err?.message || String(err),
+    });
+    return [];
+  }
+}
+
 const dataFiles = {
   checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
@@ -2578,7 +2607,7 @@ app.post(
 );
 
 // --- Orders/Updated (Local Pickup Ready For Pickup) ---
-// Production-safe path: detect READY_FOR_PICKUP from order.displayFulfillmentStatus.
+// Production-safe path: detect pickup READY_FOR_PICKUP via Fulfillment Orders.
 async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
   const allowUnverified =
     String(process.env.ALLOW_UNVERIFIED_SHOPIFY_WEBHOOKS || "").toLowerCase() ===
@@ -2646,25 +2675,6 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     return;
   }
 
-  const shippingLines = Array.isArray(order?.shipping_lines)
-    ? order.shipping_lines
-    : [];
-  const hasPickupShipping = shippingLines.some((sl) => {
-    const code = String(sl?.code || "").toLowerCase();
-    const title = String(sl?.title || "").toLowerCase();
-    return code === "pickup" || title.includes("pickup");
-  });
-  if (!hasPickupShipping) {
-    appendJsonlLog(pickupReadyWebhookLogFile, {
-      event: "orders/updated",
-      subtype: "pickup_ready",
-      result: "ignored",
-      reason: "not_pickup_order",
-      order_id: orderId,
-    });
-    return;
-  }
-
   const idempotencyKey = `order:${String(orderId)}:ready_for_pickup`;
   if (hasPickupReadyBeenNotified(idempotencyKey)) {
     appendJsonlLog(pickupReadyWebhookLogFile, {
@@ -2695,9 +2705,16 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     try {
       if (hasPickupReadyBeenNotified(idempotencyKey)) return;
 
-      const displayStatus = await fetchOrderDisplayFulfillmentStatus(orderId);
-      const normalized = String(displayStatus || "").toUpperCase();
-      if (normalized !== "READY_FOR_PICKUP") {
+      const fulfillmentOrders = await fetchFulfillmentOrders(orderId);
+      const isReadyForPickup = fulfillmentOrders.some((fo) => {
+        const methodType = String(
+          fo?.delivery_method?.method_type || fo?.delivery_method?.type || "",
+        ).toLowerCase();
+        const status = String(fo?.status || "").toUpperCase();
+        return methodType === "pickup" && status === "READY_FOR_PICKUP";
+      });
+
+      if (!isReadyForPickup) {
         appendJsonlLog(pickupReadyWebhookLogFile, {
           event: "orders/updated",
           subtype: "pickup_ready",
@@ -2705,7 +2722,12 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
           reason: "not_ready_for_pickup",
           order_id: orderId,
           idempotency_key: idempotencyKey,
-          display_fulfillment_status: displayStatus,
+          fulfillment_orders: fulfillmentOrders.map((fo) => ({
+            id: fo?.id || null,
+            status: fo?.status || null,
+            delivery_method:
+              fo?.delivery_method?.method_type || fo?.delivery_method?.type || null,
+          })),
         });
         return;
       }
@@ -2723,15 +2745,14 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
         result: "notified",
         order_id: orderId,
         idempotency_key: idempotencyKey,
-        display_fulfillment_status: displayStatus,
+        fulfillment_orders: fulfillmentOrders.map((fo) => ({
+          id: fo?.id || null,
+          status: fo?.status || null,
+          delivery_method:
+            fo?.delivery_method?.method_type || fo?.delivery_method?.type || null,
+        })),
         notification: result,
-        payload: {
-          order_id: orderId,
-          shipping_lines: shippingLines.map((sl) => ({
-            code: sl?.code || null,
-            title: sl?.title || null,
-          })),
-        },
+        payload: { order_id: orderId },
       });
     } catch (err) {
       appendJsonlLog(pickupReadyWebhookLogFile, {
