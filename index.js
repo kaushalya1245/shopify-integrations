@@ -1491,7 +1491,7 @@ async function sendOrderConfirmation(order) {
       }
     }
 
-    let orderStatusURL = `${process.env.SHOP_URL}/account/order/${order.id}`;
+    let orderStatusURL = `${process.env.HOST_NAME}/account/order/${order.id}`;
     if (order.order_status_url) {
       orderStatusURL = (() => {
         try {
