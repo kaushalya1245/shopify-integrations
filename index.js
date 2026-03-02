@@ -2501,6 +2501,14 @@ async function handleFulfillmentOrderPreparedForPickupWebhook(req, res) {
     return;
   }
 
+  appendJsonlLog(pickupReadyWebhookLogFile, {
+    event: "fulfillment_orders/line_items_prepared_for_pickup",
+    subtype: "pickup_ready",
+    result: "received",
+    order_id: orderId,
+    fulfillment_order_id: fulfillmentOrder?.id || null,
+  });
+
   const idempotencyKey = `order:${String(orderId)}:ready_for_pickup`;
   if (hasPickupReadyBeenNotified(idempotencyKey)) {
     appendJsonlLog(pickupReadyWebhookLogFile, {
@@ -2661,6 +2669,21 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     return;
   }
 
+  appendJsonlLog(pickupReadyWebhookLogFile, {
+    event: "orders/updated",
+    subtype: "pickup_ready",
+    result: "received",
+    order_id: orderId,
+    shipping_address_empty: isShippingAddressEmpty(order?.shipping_address),
+    display_fulfillment_status:
+      order?.display_fulfillment_status ||
+      order?.displayFulfillmentStatus ||
+      payload?.display_fulfillment_status ||
+      payload?.displayFulfillmentStatus ||
+      null,
+    tags: order?.tags || null,
+  });
+
   const idempotencyKey = `order:${String(orderId)}:ready_for_pickup`;
   if (hasPickupReadyBeenNotified(idempotencyKey)) {
     appendJsonlLog(pickupReadyWebhookLogFile, {
@@ -2697,7 +2720,7 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
         const methodType = normalizeToken(
           fo?.delivery_method?.method_type || fo?.delivery_method?.type || "",
         );
-        return methodType === "pickup";
+        return methodType === "pickup" || methodType.includes("pickup");
       });
 
       const isPickupOrder = shippingAddressEmpty || hasPickupDeliveryMethod;
@@ -2735,7 +2758,7 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
         const methodType = normalizeToken(
           fo?.delivery_method?.method_type || fo?.delivery_method?.type || "",
         );
-        if (methodType !== "pickup") return false;
+        if (!(methodType === "pickup" || methodType.includes("pickup"))) return false;
         return normalizeToken(fo?.status || "") === "ready_for_pickup";
       });
 
