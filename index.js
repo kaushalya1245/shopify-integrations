@@ -173,6 +173,19 @@ function orderHasReadyForPickupTag(order) {
   return tokens.includes("ready_for_pickup") || tokens.includes("readyforpickup");
 }
 
+function orderHasStorePickupTag(order) {
+  const raw = String(order?.tags || "");
+  if (!raw.trim()) return false;
+
+  const tokens = raw
+    .split(",")
+    .map((t) => normalizeToken(t))
+    .filter(Boolean);
+
+  // Primary: "Store Pickup" -> store_pickup
+  return tokens.includes("store_pickup") || tokens.includes("storepickup");
+}
+
 const dataFiles = {
   checkouts: path.resolve(__dirname, "debounced-checkouts.json"),
   orders: path.resolve(__dirname, "processed-orders.json"),
@@ -2558,6 +2571,20 @@ async function handleFulfillmentOrderPreparedForPickupWebhook(req, res) {
         return;
       }
 
+      if (!orderHasStorePickupTag(order)) {
+        appendJsonlLog(pickupReadyWebhookLogFile, {
+          event: "fulfillment_orders/line_items_prepared_for_pickup",
+          subtype: "pickup_ready",
+          result: "ignored",
+          reason: "missing_store_pickup_tag",
+          order_id: orderId,
+          idempotency_key: idempotencyKey,
+          fulfillment_order_id: fulfillmentOrder?.id || null,
+          tags: order?.tags || null,
+        });
+        return;
+      }
+
       const result = await sendPickupReadyNotification({
         order,
         fulfillmentOrder,
@@ -2674,13 +2701,6 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     subtype: "pickup_ready",
     result: "received",
     order_id: orderId,
-    shipping_address_empty: isShippingAddressEmpty(order?.shipping_address),
-    display_fulfillment_status:
-      order?.display_fulfillment_status ||
-      order?.displayFulfillmentStatus ||
-      payload?.display_fulfillment_status ||
-      payload?.displayFulfillmentStatus ||
-      null,
     tags: order?.tags || null,
   });
 
@@ -2714,77 +2734,15 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     try {
       if (hasPickupReadyBeenNotified(idempotencyKey)) return;
 
-      const fulfillmentOrders = await fetchFulfillmentOrders(orderId);
-      const shippingAddressEmpty = isShippingAddressEmpty(order?.shipping_address);
-      const hasPickupDeliveryMethod = fulfillmentOrders.some((fo) => {
-        const methodType = normalizeToken(
-          fo?.delivery_method?.method_type || fo?.delivery_method?.type || "",
-        );
-        return methodType === "pickup" || methodType.includes("pickup");
-      });
-
-      const isPickupOrder = shippingAddressEmpty || hasPickupDeliveryMethod;
-      if (!isPickupOrder) {
+      if (!orderHasStorePickupTag(order)) {
         appendJsonlLog(pickupReadyWebhookLogFile, {
           event: "orders/updated",
           subtype: "pickup_ready",
           result: "ignored",
-          reason: "not_pickup_order",
+          reason: "missing_store_pickup_tag",
           order_id: orderId,
           idempotency_key: idempotencyKey,
-          shipping_address_empty: shippingAddressEmpty,
-          has_pickup_delivery_method: hasPickupDeliveryMethod,
-          fulfillment_orders: fulfillmentOrders.map((fo) => ({
-            id: fo?.id || null,
-            status: fo?.status || null,
-            delivery_method:
-              fo?.delivery_method?.method_type || fo?.delivery_method?.type || null,
-          })),
-        });
-        return;
-      }
-
-      const displayStatus = normalizeToken(
-        order?.display_fulfillment_status ||
-          order?.displayFulfillmentStatus ||
-          payload?.display_fulfillment_status ||
-          payload?.displayFulfillmentStatus ||
-          "",
-      );
-
-      const isReadyByDisplayStatus = displayStatus === "ready_for_pickup";
-      const isReadyByTag = orderHasReadyForPickupTag(order);
-      const isReadyByFulfillmentOrder = fulfillmentOrders.some((fo) => {
-        const methodType = normalizeToken(
-          fo?.delivery_method?.method_type || fo?.delivery_method?.type || "",
-        );
-        if (!(methodType === "pickup" || methodType.includes("pickup"))) return false;
-        return normalizeToken(fo?.status || "") === "ready_for_pickup";
-      });
-
-      const isReadyForPickup =
-        isReadyByDisplayStatus || isReadyByTag || isReadyByFulfillmentOrder;
-
-      if (!isReadyForPickup) {
-        appendJsonlLog(pickupReadyWebhookLogFile, {
-          event: "orders/updated",
-          subtype: "pickup_ready",
-          result: "ignored",
-          reason: "not_ready_for_pickup",
-          order_id: orderId,
-          idempotency_key: idempotencyKey,
-          shipping_address_empty: shippingAddressEmpty,
-          has_pickup_delivery_method: hasPickupDeliveryMethod,
-          display_fulfillment_status: displayStatus || null,
-          ready_by_display_status: isReadyByDisplayStatus,
-          ready_by_tag: isReadyByTag,
-          ready_by_fulfillment_order: isReadyByFulfillmentOrder,
-          fulfillment_orders: fulfillmentOrders.map((fo) => ({
-            id: fo?.id || null,
-            status: fo?.status || null,
-            delivery_method:
-              fo?.delivery_method?.method_type || fo?.delivery_method?.type || null,
-          })),
+          tags: order?.tags || null,
         });
         return;
       }
@@ -2802,12 +2760,7 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
         result: "notified",
         order_id: orderId,
         idempotency_key: idempotencyKey,
-        fulfillment_orders: fulfillmentOrders.map((fo) => ({
-          id: fo?.id || null,
-          status: fo?.status || null,
-          delivery_method:
-            fo?.delivery_method?.method_type || fo?.delivery_method?.type || null,
-        })),
+        tags: order?.tags || null,
         notification: result,
         payload: { order_id: orderId },
       });
