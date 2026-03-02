@@ -2315,19 +2315,7 @@ async function handleFulfillmentsUpdateWebhook(req, res) {
     return;
   }
 
-  // Basic shop-domain allowlist. (HMAC is the real protection; this prevents obvious misroutes.)
-  if (process.env.SHOPIFY_DOMAIN && shopDomain && shopDomain !== process.env.SHOPIFY_DOMAIN) {
-    res.status(200).send("OK");
-    appendJsonlLog(deliveryWebhookLogFile, {
-      event: "fulfillments/update",
-      result: "ignored",
-      reason: "wrong_shop_domain",
-      topic: topic || null,
-      shop_domain: shopDomain,
-      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
-    });
-    return;
-  }
+  // Note: no shop-domain allowlist here; HMAC verification is the security gate.
 
   if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
     appendJsonlLog(deliveryWebhookLogFile, {
@@ -2441,6 +2429,15 @@ async function handleFulfillmentsUpdateWebhook(req, res) {
 
 app.post("/webhook/fulfillments-update", handleFulfillmentsUpdateWebhook);
 app.post("/webhook/fulfillments/update", handleFulfillmentsUpdateWebhook);
+// Backwards-compatible aliases (referenced by ops/upsertShopifyWebhooks.js)
+app.post(
+  "/webhook/fulfillments/update-pickup",
+  handleFulfillmentsUpdateWebhook,
+);
+app.post(
+  "/webhook/fulfillments-update-pickup",
+  handleFulfillmentsUpdateWebhook,
+);
 
 // --- Fulfillment Orders (Local Pickup Prepared For Pickup) ---
 // Shopify's dedicated webhook for "Ready for pickup" events.
@@ -2465,23 +2462,7 @@ async function handleFulfillmentOrderPreparedForPickupWebhook(req, res) {
     return;
   }
 
-  if (
-    process.env.SHOPIFY_DOMAIN &&
-    shopDomain &&
-    shopDomain !== process.env.SHOPIFY_DOMAIN
-  ) {
-    res.status(200).send("OK");
-    appendJsonlLog(pickupReadyWebhookLogFile, {
-      event: "fulfillment_orders/line_items_prepared_for_pickup",
-      subtype: "pickup_ready",
-      result: "ignored",
-      reason: "wrong_shop_domain",
-      topic: topic || null,
-      shop_domain: shopDomain,
-      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
-    });
-    return;
-  }
+  // Note: no shop-domain allowlist here; HMAC verification is the security gate.
 
   if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
     appendJsonlLog(pickupReadyWebhookLogFile, {
@@ -2650,23 +2631,7 @@ async function handleOrdersUpdatedPickupReadyWebhook(req, res) {
     return;
   }
 
-  if (
-    process.env.SHOPIFY_DOMAIN &&
-    shopDomain &&
-    shopDomain !== process.env.SHOPIFY_DOMAIN
-  ) {
-    res.status(200).send("OK");
-    appendJsonlLog(pickupReadyWebhookLogFile, {
-      event: "orders/updated",
-      subtype: "pickup_ready",
-      result: "ignored",
-      reason: "wrong_shop_domain",
-      topic: topic || null,
-      shop_domain: shopDomain,
-      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
-    });
-    return;
-  }
+  // Note: no shop-domain allowlist here; HMAC verification is the security gate.
 
   if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
     appendJsonlLog(pickupReadyWebhookLogFile, {
@@ -2812,22 +2777,7 @@ async function handleRefundsCreateWebhook(req, res) {
     return;
   }
 
-  if (
-    process.env.SHOPIFY_DOMAIN &&
-    shopDomain &&
-    shopDomain !== process.env.SHOPIFY_DOMAIN
-  ) {
-    res.status(200).send("OK");
-    appendJsonlLog(storeCreditRefundWebhookLogFile, {
-      event: "refunds/create",
-      result: "ignored",
-      reason: "wrong_shop_domain",
-      topic: topic || null,
-      shop_domain: shopDomain,
-      expected_shop_domain: process.env.SHOPIFY_DOMAIN,
-    });
-    return;
-  }
+  // Note: no shop-domain allowlist here; HMAC verification is the security gate.
 
   if (!allowUnverified && !verifyShopifyWebhookHmac(req)) {
     appendJsonlLog(storeCreditRefundWebhookLogFile, {
