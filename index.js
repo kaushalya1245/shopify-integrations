@@ -475,7 +475,6 @@ async function resolveDeliveryRecipient(fulfillment) {
       }
     }
   } catch (err) {
-    // ignore, we'll return base info
   }
 
   return {
@@ -1739,12 +1738,30 @@ const processedFulfillments = loadSet(dataFiles.fulfillments, "set");
 
 async function sendFulfillmentMessage(fulfillment) {
   try {
+    const rawTrackingNumber = fulfillment?.tracking_number;
+    if (!rawTrackingNumber || !String(rawTrackingNumber).trim()) {
+      console.log(
+        `Skipping fulfillment ${fulfillment?.id} (order ${fulfillment?.order_id}) because tracking_number is missing`,
+      );
+
+      // Mark as processed so Shopify webhook retries don't spam logs.
+      if (fulfillment?.id) {
+        saveSet(
+          dataFiles.fulfillments,
+          processedFulfillments,
+          fulfillment.id.toString(),
+          "set",
+        );
+      }
+      return;
+    }
+
     const orderId = fulfillment.order_id;
     const customer = fulfillment.destination || {};
     const name = customer.first_name || "Customer";
     const orderName =
       fulfillment.name.replace("#", "").split(".")[0] || "Unknown Order";
-    const trackingNumber = fulfillment.tracking_number || "Unknown fulfillment";
+    const trackingNumber = String(rawTrackingNumber).trim();
     let amount = "0";
     let orderData = null;
     try {
