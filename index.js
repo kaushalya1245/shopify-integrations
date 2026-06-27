@@ -1487,96 +1487,6 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 //   }
 // }
 
-async function sendStorePickupMessage(order) {
-  try {
-    const customer = order.customer || {};
-    const shippingAddress = order.shipping_address || {};
-    const billingAddress = order.billing_address || {};
-
-    const name =
-      shippingAddress.first_name ||
-      customer.first_name ||
-      "Customer";
-
-    const orderName = order.name.replace("#", "");
-    const amount = order.total_price || "0";
-
-    const countryCode =
-      shippingAddress.country_code ||
-      billingAddress.country_code ||
-      "IN";
-
-    const dialCode = getDialCode(countryCode);
-
-    let rawPhone =
-      shippingAddress.phone ||
-      billingAddress.phone ||
-      order.phone ||
-      customer.phone ||
-      customer.default_address?.phone ||
-      "";
-
-    const cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
-    const phoneNumber = dialCode + cleanedPhone;
-
-    let imageUrl =
-      "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/store-pickup.jpg";
-
-    if (order.line_items?.length) {
-      const productId = order.line_items[0].product_id;
-      const variantId = order.line_items[0].variant_id;
-
-      try {
-        const headers = {
-          headers: {
-            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-          },
-        };
-
-        const res = await axios.get(
-          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
-          headers
-        );
-
-        if (res.data.images.length) {
-          const variantImage = res.data.images.find((img) =>
-            img.variant_ids.includes(variantId)
-          );
-
-          imageUrl = (variantImage || res.data.images[0]).src.split("?")[0];
-        }
-      } catch (e) {
-        console.error("Failed to fetch pickup image");
-      }
-    }
-
-    const payload = {
-      to: phoneNumber,
-      from: "+919136524727",
-      templateName: "kaj_store_pickup_alert",
-      language: "en",
-      bodyPlaceholders: [
-        name,
-        orderName,
-        `₹${amount}`,
-      ],
-      headerImageUrl: imageUrl,
-      headerFilename: "pickup.jpg",
-    };
-
-    await sendDoubleTickTemplateMessage(payload);
-
-    console.log(
-      `Store Pickup message sent to ${name} (${cleanedPhone})`
-    );
-  } catch (err) {
-    console.error(
-      "Store Pickup message error",
-      err?.response?.data || err?.message
-    );
-  }
-}
-
 const processedOrders = loadSet(dataFiles.orders, "set");
 
 async function sendOrderConfirmation(order) {
@@ -1605,14 +1515,6 @@ async function sendOrderConfirmation(order) {
       "";
     let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
     const phoneNumberInternationalFormat = dialCode + cleanedPhone;
-
-    const isStorePickup =
-      order.shipping_lines?.some(
-        (line) =>
-          line.code?.toLowerCase().includes("pickup") ||
-          line.title?.toLowerCase().includes("pickup") ||
-          line.delivery_category === "pickup",
-      ) || false;
 
     let imageUrl =
       "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
@@ -1673,12 +1575,6 @@ async function sendOrderConfirmation(order) {
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
       console.log(`Order confirmation message sent for ${order.cart_token}`);
       console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
-
-      if (isStorePickup) {
-        await sendStorePickupMessage(order);
-      } else {
-        await sendOrderConfirmation(order);
-      }
     } catch (err) {
       console.error(
         "Order confirmation message error",
