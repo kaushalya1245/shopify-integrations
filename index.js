@@ -600,12 +600,12 @@ async function sendDoubleTickTemplateMessage({
           templateData: {
             ...(headerImageUrl
               ? {
-                  header: {
-                    type: "IMAGE",
-                    mediaUrl: headerImageUrl,
-                    filename: headerFilename || "image.jpeg",
-                  },
-                }
+                header: {
+                  type: "IMAGE",
+                  mediaUrl: headerImageUrl,
+                  filename: headerFilename || "image.jpeg",
+                },
+              }
               : {}),
             body: {
               placeholders: (bodyPlaceholders || []).map((v) =>
@@ -614,13 +614,13 @@ async function sendDoubleTickTemplateMessage({
             },
             ...(buttonUrl
               ? {
-                  buttons: [
-                    {
-                      type: "URL",
-                      parameter: String(buttonUrl),
-                    },
-                  ],
-                }
+                buttons: [
+                  {
+                    type: "URL",
+                    parameter: String(buttonUrl),
+                  },
+                ],
+              }
               : {}),
           },
         },
@@ -939,8 +939,8 @@ async function createOrderFromPayment(checkout, payment) {
           title: checkout?.shipping_lines[0]?.title || "Standard",
           price: parseFloat(
             checkout.shipping_lines[0]?.price ||
-              checkout?.shipping_lines[0]?.original_shop_price ||
-              0,
+            checkout?.shipping_lines[0]?.original_shop_price ||
+            0,
           ).toFixed(2),
           code: checkout.shipping_lines[0]?.code || "Standard",
           source: "shopify",
@@ -1221,8 +1221,8 @@ async function verifyCheckout(checkout) {
 
           const checkoutPhoneDigits = extractDigitsPhone(
             checkout?.shipping_address?.phone ||
-              checkout?.billing_address?.phone ||
-              checkout?.phone,
+            checkout?.billing_address?.phone ||
+            checkout?.phone,
           ).slice(-10);
 
           const matchesPhoneAndAmount =
@@ -1518,6 +1518,7 @@ async function sendOrderConfirmation(order) {
 
     let imageUrl =
       "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+
     if (order.line_items?.length) {
       const productId = order.line_items[0].product_id;
       const variantId = order.line_items[0].variant_id;
@@ -1588,6 +1589,96 @@ async function sendOrderConfirmation(order) {
     }
   } catch (err) {
     console.error("Order confirmation error");
+  }
+}
+
+async function sendStorePickupMessage(order) {
+  try {
+    const customer = order.customer || {};
+    const shippingAddress = order.shipping_address || {};
+    const billingAddress = order.billing_address || {};
+
+    const name =
+      shippingAddress.first_name ||
+      customer.first_name ||
+      "Customer";
+
+    const orderName = order.name.replace("#", "");
+    const amount = order.total_price || "0";
+
+    const countryCode =
+      shippingAddress.country_code ||
+      billingAddress.country_code ||
+      "IN";
+
+    const dialCode = getDialCode(countryCode);
+
+    let rawPhone =
+      shippingAddress.phone ||
+      billingAddress.phone ||
+      order.phone ||
+      customer.phone ||
+      customer.default_address?.phone ||
+      "";
+
+    const cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
+    const phoneNumber = dialCode + cleanedPhone;
+
+    let imageUrl =
+      "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/store-pickup.jpg";
+
+    if (order.line_items?.length) {
+      const productId = order.line_items[0].product_id;
+      const variantId = order.line_items[0].variant_id;
+
+      try {
+        const headers = {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        };
+
+        const res = await axios.get(
+          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
+          headers
+        );
+
+        if (res.data.images.length) {
+          const variantImage = res.data.images.find((img) =>
+            img.variant_ids.includes(variantId)
+          );
+
+          imageUrl = (variantImage || res.data.images[0]).src.split("?")[0];
+        }
+      } catch (e) {
+        console.error("Failed to fetch pickup image");
+      }
+    }
+
+    const payload = {
+      to: phoneNumber,
+      from: "+919136524727",
+      templateName: "kaj_store_pickup_alert",
+      language: "en",
+      bodyPlaceholders: [
+        name,
+        orderName,
+        `₹${amount}`,
+      ],
+      headerImageUrl: imageUrl,
+      headerFilename: "pickup.jpg",
+    };
+
+    await sendDoubleTickTemplateMessage(payload);
+
+    console.log(
+      `Store Pickup message sent to ${name} (${cleanedPhone})`
+    );
+  } catch (err) {
+    console.error(
+      "Store Pickup message error",
+      err?.response?.data || err?.message
+    );
   }
 }
 
@@ -1731,6 +1822,16 @@ app.post("/webhook/order-confirmation", (req, res) => {
   // processOrder(order);
   sendLowStockNotification(order);
   sendOrderConfirmation(order);
+
+  // Send one more message if this is a Store Pickup order
+  const isStorePickup = order.shipping_lines?.some(line =>
+    (line.title || "").toLowerCase().includes("pickup") ||
+    (line.code || "").toLowerCase().includes("pickup")
+  );
+
+  if (isStorePickup) {
+    sendStorePickupMessage(order);
+  }
 });
 
 // --- Fulfillment Creation ---
@@ -2122,7 +2223,7 @@ function scheduleReviewSendForFulfillmentId(fulfillmentId, deliveredAtMs) {
 
   const timeoutId = setTimeout(() => {
     __reviewTimersByFulfillmentId.delete(String(fulfillmentId));
-    attemptSendReviewForFulfillmentId(String(fulfillmentId)).catch(() => {});
+    attemptSendReviewForFulfillmentId(String(fulfillmentId)).catch(() => { });
   }, msUntilDue);
 
   __reviewTimersByFulfillmentId.set(String(fulfillmentId), { timeoutId, dueAtMs });
@@ -2820,8 +2921,8 @@ async function handleRefundsCreateWebhook(req, res) {
   if (!matches.length || amount <= 0) {
     const gateways = Array.isArray(refund?.transactions)
       ? refund.transactions
-          .map((t) => (t ? String(t.gateway || "") : ""))
-          .filter(Boolean)
+        .map((t) => (t ? String(t.gateway || "") : ""))
+        .filter(Boolean)
       : [];
     appendJsonlLog(storeCreditRefundWebhookLogFile, {
       event: "refunds/create",
@@ -3456,7 +3557,7 @@ app.listen(PORT, () => {
 
   const hasReviewUrlConfig = Boolean(
     String(process.env.REVIEW_BUTTON_URL_TEMPLATE || "").trim() ||
-      String(process.env.REVIEW_BUTTON_URL || "").trim(),
+    String(process.env.REVIEW_BUTTON_URL || "").trim(),
   );
 
   if (schedulerEnabled && !hasReviewUrlConfig) {
@@ -3470,10 +3571,10 @@ app.listen(PORT, () => {
 
   // Run shortly after boot, then periodically.
   setTimeout(() => {
-    runReviewSchedulerOnce().catch(() => {});
+    runReviewSchedulerOnce().catch(() => { });
   }, 30 * 1000);
 
   setInterval(() => {
-    runReviewSchedulerOnce().catch(() => {});
+    runReviewSchedulerOnce().catch(() => { });
   }, intervalMs);
 });
