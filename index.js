@@ -1553,7 +1553,7 @@ async function sendStorePickupMessage(order) {
     const payload = {
       to: phoneNumber,
       from: "+919136524727",
-      templateName: "kaj_store_pickup_v1",
+      templateName: "kaj_store_pickup_alert",
       language: "en",
       bodyPlaceholders: [
         name,
