@@ -1489,6 +1489,25 @@ app.post("/webhook/abandoned-checkouts", async (req, res) => {
 
 const processedOrders = loadSet(dataFiles.orders, "set");
 
+function isStorePickupOrder(order) {
+  if (!order) return false;
+
+  // Store Pickup orders generally have no shipping address
+  if (!order.shipping_address) return true;
+
+  return (
+    order.shipping_lines?.some((line) => {
+      const code = (line.code || "").toLowerCase();
+      const title = (line.title || "").toLowerCase();
+
+      return (
+        code.startsWith("kaushalya art jewellery") ||
+        title.startsWith("kaushalya art jewellery")
+      );
+    }) || false
+  );
+}
+
 async function sendOrderConfirmation(order) {
   try {
     const customer = order.customer || {};
@@ -1568,6 +1587,102 @@ async function sendOrderConfirmation(order) {
       headerImageUrl: imageUrl,
       headerFilename: "order.jpg",
       buttonUrl: orderStatusURL,
+    };
+
+    try {
+      const response = await sendDoubleTickTemplateMessage(payload);
+      saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
+      console.log(`Order confirmation message sent for ${order.cart_token}`);
+      console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+    } catch (err) {
+      console.error(
+        "Order confirmation message error",
+        err?.response?.data || err?.message,
+      );
+      console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
+      if (err.response) {
+        console.error("Response data:", err.response.data);
+        console.error("Response status:", err.response.status);
+      }
+    }
+  } catch (err) {
+    console.error("Order confirmation error");
+  }
+}
+
+async function sendStorePickupAlert(order) {
+  try {
+    const customer = order.customer || {};
+    const shippingAddress = order.shipping_address || {};
+    const billingAddress = order.billing_address || {};
+    const name =
+      shippingAddress.first_name || customer.first_name || "Customer";
+    const orderName = order.name.replace("#", "") || "Unknown Order";
+    const amount = order.total_price || "0";
+
+    const countryCode =
+      order.shipping_address?.country_code ||
+      order.billing_address?.country_code ||
+      "IN";
+
+    const dialCode = getDialCode(countryCode);
+
+    let rawPhone =
+      shippingAddress.phone ||
+      billingAddress.phone ||
+      order?.phone ||
+      customer.phone ||
+      customer?.default_address?.phone ||
+      "";
+    let cleanedPhone = rawPhone.replace(/\s+/g, "").slice(-10);
+    const phoneNumberInternationalFormat = dialCode + cleanedPhone;
+
+    let imageUrl =
+      "https://cdn.shopify.com/s/files/1/0655/1352/1302/files/WhatsApp_Image_2025-05-21_at_21.13.58.jpg";
+    if (order.line_items?.length) {
+      const productId = order.line_items[0].product_id;
+      const variantId = order.line_items[0].variant_id;
+      const headers = {
+        headers: { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN },
+      };
+
+      try {
+        const productImagesRes = await axios.get(
+          `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2025-04/products/${productId}/images.json`,
+          headers,
+        );
+        if (productImagesRes?.data?.images?.length) {
+          const variantImage = productImagesRes?.data?.images.find((img) =>
+            img.variant_ids.includes(variantId),
+          );
+          imageUrl = (
+            variantImage || productImagesRes?.data?.images[0]
+          ).src.split("?")[0];
+        }
+      } catch (imageError) {
+        console.error("Failed to fetch product image");
+      }
+    }
+
+    let orderStatusURL = `${process.env.HOST_NAME}/account/order/${order.id}`;
+    if (order.order_status_url) {
+      orderStatusURL = (() => {
+        try {
+          const url = new URL(order.order_status_url);
+          return url.pathname.replace(/^\//, "");
+        } catch {
+          return order.order_status_url;
+        }
+      })();
+    }
+
+    const payload = {
+      to: phoneNumberInternationalFormat,
+      from: "+919136524727",
+      templateName:
+        process.env.SPA_CAMPAIGN_NAME ||
+        "kaj_store_pickup_alert",
+      language: process.env.DT_LANGUAGE || "en",
     };
 
     try {
@@ -1730,7 +1845,14 @@ app.post("/webhook/order-confirmation", (req, res) => {
 
   // processOrder(order);
   sendLowStockNotification(order);
+
+  // Always send order confirmation
   sendOrderConfirmation(order);
+
+  // Send an additional Store Pickup message
+  if (isStorePickupOrder(order)) {
+    sendStorePickupAlert(order);
+  }
 });
 
 // --- Fulfillment Creation ---
