@@ -3697,31 +3697,31 @@ async function resolveShopifyOrderForVelocity({ orderExternalId, trackingNumber 
             name: node.name,
             shipping_address: node.shippingAddress
               ? {
-                  first_name: node.shippingAddress.firstName,
-                  last_name: node.shippingAddress.lastName,
-                  phone: node.shippingAddress.phone,
-                  country_code: node.shippingAddress.countryCode,
-                }
+                first_name: node.shippingAddress.firstName,
+                last_name: node.shippingAddress.lastName,
+                phone: node.shippingAddress.phone,
+                country_code: node.shippingAddress.countryCode,
+              }
               : null,
             billing_address: node.billingAddress
               ? {
-                  first_name: node.billingAddress.firstName,
-                  last_name: node.billingAddress.lastName,
-                  phone: node.billingAddress.phone,
-                  country_code: node.billingAddress.countryCode,
-                }
+                first_name: node.billingAddress.firstName,
+                last_name: node.billingAddress.lastName,
+                phone: node.billingAddress.phone,
+                country_code: node.billingAddress.countryCode,
+              }
               : null,
             customer: node.customer
               ? {
-                  first_name: node.customer.firstName,
-                  last_name: node.customer.lastName,
-                  phone: node.customer.phone,
-                  default_address: node.customer.defaultAddress
-                    ? {
-                        phone: node.customer.defaultAddress.phone,
-                      }
-                    : null,
-                }
+                first_name: node.customer.firstName,
+                last_name: node.customer.lastName,
+                phone: node.customer.phone,
+                default_address: node.customer.defaultAddress
+                  ? {
+                    phone: node.customer.defaultAddress.phone,
+                  }
+                  : null,
+              }
               : null,
             phone: node.phone,
           };
@@ -3784,31 +3784,31 @@ async function resolveShopifyOrderForVelocity({ orderExternalId, trackingNumber 
           name: node.name,
           shipping_address: node.shippingAddress
             ? {
-                first_name: node.shippingAddress.firstName,
-                last_name: node.shippingAddress.lastName,
-                phone: node.shippingAddress.phone,
-                country_code: node.shippingAddress.countryCode,
-              }
+              first_name: node.shippingAddress.firstName,
+              last_name: node.shippingAddress.lastName,
+              phone: node.shippingAddress.phone,
+              country_code: node.shippingAddress.countryCode,
+            }
             : null,
           billing_address: node.billingAddress
             ? {
-                first_name: node.billingAddress.firstName,
-                last_name: node.billingAddress.lastName,
-                phone: node.billingAddress.phone,
-                country_code: node.billingAddress.countryCode,
-              }
+              first_name: node.billingAddress.firstName,
+              last_name: node.billingAddress.lastName,
+              phone: node.billingAddress.phone,
+              country_code: node.billingAddress.countryCode,
+            }
             : null,
           customer: node.customer
             ? {
-                first_name: node.customer.firstName,
-                last_name: node.customer.lastName,
-                phone: node.customer.phone,
-                default_address: node.customer.defaultAddress
-                  ? {
-                      phone: node.customer.defaultAddress.phone,
-                    }
-                  : null,
-              }
+              first_name: node.customer.firstName,
+              last_name: node.customer.lastName,
+              phone: node.customer.phone,
+              default_address: node.customer.defaultAddress
+                ? {
+                  phone: node.customer.defaultAddress.phone,
+                }
+                : null,
+            }
             : null,
           phone: node.phone,
         };
@@ -3824,7 +3824,7 @@ async function resolveShopifyOrderForVelocity({ orderExternalId, trackingNumber 
 async function sendOutForDeliveryNotification(data) {
   const orderExternalId = data?.order_external_id;
   const trackingNumber = data?.tracking_number;
-  const trackingUrl = data?.tracking_url;
+  const trackingUrl = "https://kaushalyaartjewellery.logisy.tech/track-order/";
 
   const dedupKey = String(trackingNumber || orderExternalId || data?.order_id || "").trim();
   if (dedupKey && hasOutForDeliveryBeenNotified(dedupKey)) {
