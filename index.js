@@ -202,6 +202,7 @@ const dataFiles = {
     __dirname,
     "processed-store-credit-refunds.json",
   ),
+  outForDelivery: path.resolve(__dirname, "processed-out-for-delivery.json"),
   payments: path.resolve(__dirname, "processed-payments.json"),
   locks: path.resolve(__dirname, "in-process-locks.json"),
 };
@@ -229,6 +230,11 @@ const pickupReadyWebhookLogFile = path.resolve(
 const deliveryReviewLogFile = path.resolve(
   __dirname,
   "delivery-review-logs.jsonl",
+);
+
+const velocityWebhookLogFile = path.resolve(
+  __dirname,
+  "velocity-webhook-logs.jsonl",
 );
 
 // In-memory timers to send review messages close to the target delay.
@@ -1688,21 +1694,21 @@ async function sendStorePickupAlert(order) {
     try {
       const response = await sendDoubleTickTemplateMessage(payload);
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
-      console.log(`Order confirmation message sent for ${order.cart_token}`);
-      console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+      console.log(`Store pickup alert message sent for ${order.cart_token}`);
+      console.log(`Store pickup alert sent to ${name} (${cleanedPhone})`);
     } catch (err) {
       console.error(
-        "Order confirmation message error",
+        "Store pickup alert message error",
         err?.response?.data || err?.message,
       );
-      console.log(`Order confirmation cannot be sent to (${cleanedPhone})`);
+      console.log(`Store pickup alert cannot be sent to (${cleanedPhone})`);
       if (err.response) {
         console.error("Response data:", err.response.data);
         console.error("Response status:", err.response.status);
       }
     }
   } catch (err) {
-    console.error("Order confirmation error");
+    console.error("Store pickup alert error");
   }
 }
 
@@ -2130,6 +2136,17 @@ function markPickupReadyNotified(key) {
   const set = loadSet(dataFiles.pickupReady, "set");
   set.add(String(key));
   fs.writeFileSync(dataFiles.pickupReady, JSON.stringify(Array.from(set)));
+}
+
+function hasOutForDeliveryBeenNotified(key) {
+  const set = loadSet(dataFiles.outForDelivery, "set");
+  return set.has(String(key));
+}
+
+function markOutForDeliveryNotified(key) {
+  const set = loadSet(dataFiles.outForDelivery, "set");
+  set.add(String(key));
+  fs.writeFileSync(dataFiles.outForDelivery, JSON.stringify(Array.from(set)));
 }
 
 function loadDeliveryReviewRecords() {
@@ -3561,6 +3578,447 @@ app.post("/webhook/refund-processed", async (req, res) => {
     console.error("Refund webhook handler error:", err?.message || err);
   }
 });
+
+// --- Velocity Out For Delivery Integration ---
+
+/**
+ * Resiliently resolves a Shopify order from Velocity webhook data.
+ * Supports:
+ *  1. Direct numeric Shopify Order ID
+ *  2. Global GraphQL Order ID (gid://shopify/Order/...)
+ *  3. Order Name/Number search via REST (e.g. #1001 or 1001)
+ *  4. Order search via GraphQL
+ *  5. Fallback search by Tracking Number / AWB via GraphQL
+ */
+async function resolveShopifyOrderForVelocity({ orderExternalId, trackingNumber }) {
+  const externalIdStr = String(orderExternalId || "").trim();
+
+  // Strategy 1: Direct numeric order ID lookup
+  if (externalIdStr && /^\d+$/.test(externalIdStr)) {
+    try {
+      const resp = await client.get({
+        path: `orders/${externalIdStr}`,
+      });
+      if (resp?.body?.order) {
+        return resp.body.order;
+      }
+    } catch (err) {
+      // 404 or invalid ID - fall through to name search
+    }
+  }
+
+  // If externalId starts with gid://shopify/Order/
+  if (externalIdStr && externalIdStr.startsWith("gid://shopify/Order/")) {
+    const numericId = externalIdStr.split("/").pop();
+    try {
+      const resp = await client.get({
+        path: `orders/${numericId}`,
+      });
+      if (resp?.body?.order) {
+        return resp.body.order;
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  // Strategy 2: Search by order name / number using REST API
+  if (externalIdStr) {
+    const candidates = [
+      externalIdStr,
+      externalIdStr.startsWith("#") ? externalIdStr.slice(1) : `#${externalIdStr}`,
+    ];
+
+    for (const cand of candidates) {
+      try {
+        const resp = await client.get({
+          path: "orders",
+          query: { status: "any", limit: 1, name: cand },
+        });
+        if (resp?.body?.orders && resp.body.orders.length > 0) {
+          return resp.body.orders[0];
+        }
+      } catch (err) {
+        // continue
+      }
+    }
+  }
+
+  // Strategy 3: GraphQL search by order name or ID
+  if (externalIdStr) {
+    const cleanName = externalIdStr.replace(/["'\\]/g, "");
+    const gqlQuery = `query ($query: String!) {
+      orders(first: 1, query: $query) {
+        edges {
+          node {
+            id
+            legacyResourceId
+            name
+            displayFulfillmentStatus
+            phone
+            shippingAddress {
+              firstName
+              lastName
+              phone
+              countryCode
+            }
+            billingAddress {
+              firstName
+              lastName
+              phone
+              countryCode
+            }
+            customer {
+              firstName
+              lastName
+              phone
+              defaultAddress {
+                phone
+              }
+            }
+          }
+        }
+      }
+    }`;
+
+    for (const q of [`name:${cleanName}`, `name:#${cleanName.replace(/^#/, "")}`, `id:${cleanName}`]) {
+      try {
+        const resp = await gqlClient.query({
+          data: {
+            query: gqlQuery,
+            variables: { query: q },
+          },
+        });
+        const edge = resp?.body?.data?.orders?.edges?.[0];
+        if (edge?.node) {
+          const node = edge.node;
+          return {
+            id: node.legacyResourceId || (node.id ? node.id.split("/").pop() : null),
+            name: node.name,
+            shipping_address: node.shippingAddress
+              ? {
+                  first_name: node.shippingAddress.firstName,
+                  last_name: node.shippingAddress.lastName,
+                  phone: node.shippingAddress.phone,
+                  country_code: node.shippingAddress.countryCode,
+                }
+              : null,
+            billing_address: node.billingAddress
+              ? {
+                  first_name: node.billingAddress.firstName,
+                  last_name: node.billingAddress.lastName,
+                  phone: node.billingAddress.phone,
+                  country_code: node.billingAddress.countryCode,
+                }
+              : null,
+            customer: node.customer
+              ? {
+                  first_name: node.customer.firstName,
+                  last_name: node.customer.lastName,
+                  phone: node.customer.phone,
+                  default_address: node.customer.defaultAddress
+                    ? {
+                        phone: node.customer.defaultAddress.phone,
+                      }
+                    : null,
+                }
+              : null,
+            phone: node.phone,
+          };
+        }
+      } catch (err) {
+        // continue
+      }
+    }
+  }
+
+  // Strategy 4: Fallback search by tracking number via GraphQL
+  const cleanTracking = String(trackingNumber || "").trim().replace(/["'\\]/g, "");
+  if (cleanTracking) {
+    try {
+      const trackingQuery = `query ($query: String!) {
+        orders(first: 1, query: $query) {
+          edges {
+            node {
+              id
+              legacyResourceId
+              name
+              phone
+              shippingAddress {
+                firstName
+                lastName
+                phone
+                countryCode
+              }
+              billingAddress {
+                firstName
+                lastName
+                phone
+                countryCode
+              }
+              customer {
+                firstName
+                lastName
+                phone
+                defaultAddress {
+                  phone
+                }
+              }
+            }
+          }
+        }
+      }`;
+
+      const resp = await gqlClient.query({
+        data: {
+          query: trackingQuery,
+          variables: { query: `tracking_number:${cleanTracking}` },
+        },
+      });
+
+      const edge = resp?.body?.data?.orders?.edges?.[0];
+      if (edge?.node) {
+        const node = edge.node;
+        return {
+          id: node.legacyResourceId || (node.id ? node.id.split("/").pop() : null),
+          name: node.name,
+          shipping_address: node.shippingAddress
+            ? {
+                first_name: node.shippingAddress.firstName,
+                last_name: node.shippingAddress.lastName,
+                phone: node.shippingAddress.phone,
+                country_code: node.shippingAddress.countryCode,
+              }
+            : null,
+          billing_address: node.billingAddress
+            ? {
+                first_name: node.billingAddress.firstName,
+                last_name: node.billingAddress.lastName,
+                phone: node.billingAddress.phone,
+                country_code: node.billingAddress.countryCode,
+              }
+            : null,
+          customer: node.customer
+            ? {
+                first_name: node.customer.firstName,
+                last_name: node.customer.lastName,
+                phone: node.customer.phone,
+                default_address: node.customer.defaultAddress
+                  ? {
+                      phone: node.customer.defaultAddress.phone,
+                    }
+                  : null,
+              }
+            : null,
+          phone: node.phone,
+        };
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
+async function sendOutForDeliveryNotification(data) {
+  const orderExternalId = data?.order_external_id;
+  const trackingNumber = data?.tracking_number;
+  const trackingUrl = data?.tracking_url;
+
+  const dedupKey = String(trackingNumber || orderExternalId || data?.order_id || "").trim();
+  if (dedupKey && hasOutForDeliveryBeenNotified(dedupKey)) {
+    console.log(
+      `[Velocity OFD] Skipping already notified out-for-delivery for key: ${dedupKey}`,
+    );
+    return { ok: false, reason: "ALREADY_NOTIFIED", key: dedupKey };
+  }
+
+  // Resolve Shopify order
+  let order = null;
+  try {
+    order = await resolveShopifyOrderForVelocity({
+      orderExternalId,
+      trackingNumber,
+    });
+  } catch (err) {
+    console.error(
+      "[Velocity OFD] Failed to resolve Shopify order:",
+      err?.response?.data || err?.message || err,
+    );
+  }
+
+  if (!order) {
+    console.log(
+      `[Velocity OFD] Could not find Shopify order for external ID '${orderExternalId}' / tracking '${trackingNumber}'`,
+    );
+    appendJsonlLog(velocityWebhookLogFile, {
+      timestamp: new Date().toISOString(),
+      event: "status_change",
+      status: data?.status,
+      orderExternalId,
+      trackingNumber,
+      error: "SHOPIFY_ORDER_NOT_FOUND",
+      rawData: data,
+    });
+    return { ok: false, reason: "SHOPIFY_ORDER_NOT_FOUND" };
+  }
+
+  const shipping = order.shipping_address || {};
+  const billing = order.billing_address || {};
+  const customer = order.customer || {};
+
+  const name =
+    shipping.first_name ||
+    customer.first_name ||
+    billing.first_name ||
+    "Customer";
+
+  const countryCode =
+    shipping.country_code ||
+    billing.country_code ||
+    "IN";
+
+  const dialCode = getDialCode(countryCode) || "+91";
+
+  const rawPhone =
+    shipping.phone ||
+    billing.phone ||
+    customer.phone ||
+    customer.default_address?.phone ||
+    order.phone ||
+    "";
+
+  const cleanedPhone = String(rawPhone).replace(/\D/g, "").slice(-10);
+
+  if (!cleanedPhone) {
+    console.log(
+      `[Velocity OFD] No valid phone number found for order ${order.name || order.id}`,
+    );
+    appendJsonlLog(velocityWebhookLogFile, {
+      timestamp: new Date().toISOString(),
+      event: "status_change",
+      status: data?.status,
+      orderExternalId,
+      orderId: order.id,
+      orderName: order.name,
+      error: "NO_VALID_PHONE",
+      rawData: data,
+    });
+    return { ok: false, reason: "NO_VALID_PHONE" };
+  }
+
+  const phoneNumber = dialCode + cleanedPhone;
+
+  const orderName =
+    order.name?.replace("#", "") ||
+    String(orderExternalId || "").replace("#", "") ||
+    "your order";
+
+  const hostName = process.env.HOST_NAME || "kaushalyaartjewellery.com";
+  const fallbackOrderUrl = order.id
+    ? (hostName.startsWith("http") ? hostName : `https://${hostName}`) + `/account/order/${order.id}`
+    : `https://${hostName}`;
+
+  const messagePayload = {
+    to: phoneNumber,
+    templateName:
+      process.env.OFD_CAMPAIGN_NAME ||
+      process.env.OFD_TEMPLATE_NAME ||
+      "kaj_out_for_delivery",
+    language: process.env.DT_LANGUAGE || "en",
+    // Template: Hi {{1}}, Good news! Your order {{2}} is on its way and will be delivered today. 🚚
+    bodyPlaceholders: [name, orderName],
+    buttonUrl: trackingUrl || fallbackOrderUrl,
+  };
+
+  try {
+    const response = await sendDoubleTickTemplateMessage(messagePayload);
+
+    if (dedupKey) {
+      markOutForDeliveryNotified(dedupKey);
+    }
+    if (order.id) markOutForDeliveryNotified(`order_${order.id}`);
+    if (order.name) markOutForDeliveryNotified(`order_${order.name}`);
+
+    console.log(
+      `[Velocity OFD] Out-for-delivery WhatsApp sent for ${orderName} to ${cleanedPhone}`,
+    );
+
+    appendJsonlLog(velocityWebhookLogFile, {
+      timestamp: new Date().toISOString(),
+      event: "status_change",
+      status: data?.status,
+      orderExternalId,
+      orderId: order.id,
+      orderName: order.name,
+      recipientPhone: phoneNumber,
+      recipientName: name,
+      trackingNumber,
+      providerResponse: response?.data,
+    });
+
+    return { ok: true, providerResponse: response?.data };
+  } catch (err) {
+    console.error(
+      "[Velocity OFD] DoubleTick send failed:",
+      err?.response?.data || err?.message || err,
+    );
+    appendJsonlLog(velocityWebhookLogFile, {
+      timestamp: new Date().toISOString(),
+      event: "status_change",
+      status: data?.status,
+      orderExternalId,
+      orderId: order.id,
+      orderName: order.name,
+      recipientPhone: phoneNumber,
+      trackingNumber,
+      error: "DOUBLETICK_SEND_FAILED",
+      errorMessage: err?.message,
+      errorDetails: err?.response?.data,
+    });
+    throw err;
+  }
+}
+
+async function handleVelocityStatusWebhook(req, res) {
+  // Acknowledge Velocity immediately
+  res.status(200).send("OK");
+
+  const payload = req.body || {};
+  const data = payload.data || {};
+
+  console.log("Velocity status webhook received:", {
+    event: payload.event,
+    event_id: payload.event_id,
+    status: data.status,
+    tracking_number: data.tracking_number,
+    order_external_id: data.order_external_id,
+  });
+
+  const event = String(payload.event || "").toLowerCase();
+  const status = String(data.status || "").toLowerCase().replace(/[\s-]+/g, "_");
+
+  // Velocity triggers status_change event with out_for_delivery status
+  if (status !== "out_for_delivery") {
+    console.log(
+      `[Velocity Webhook] Ignored non-OFD status: '${data.status}' (event: '${payload.event}')`,
+    );
+    return;
+  }
+
+  try {
+    await sendOutForDeliveryNotification(data);
+  } catch (err) {
+    console.error(
+      "[Velocity Webhook] Out-for-delivery notification failed:",
+      err?.response?.data || err?.message || err,
+    );
+  }
+}
+
+app.post("/webhook/velocity-status", handleVelocityStatusWebhook);
+app.post("/webhook/velocity/status", handleVelocityStatusWebhook);
 
 
 
