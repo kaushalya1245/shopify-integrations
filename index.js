@@ -1920,7 +1920,9 @@ async function sendFulfillmentMessage(fulfillment) {
     const phoneNumberInternationalFormat = dialCode + cleanedPhone;
 
     // const fulfillmentStatusURL = fulfillment.tracking_url;
-    const fulfillmentStatusURL = "https://kaushalyaartjewellery.logisy.tech/track-order/";
+    const fulfillmentStatusURL =
+      process.env.TRACK_ORDER_URL ||
+      "https://kaushalyaartjewellery.logisy.tech/track-order/";
 
     // Product image
     let imageUrl =
@@ -3824,7 +3826,9 @@ async function resolveShopifyOrderForVelocity({ orderExternalId, trackingNumber 
 async function sendOutForDeliveryNotification(data) {
   const orderExternalId = data?.order_external_id;
   const trackingNumber = data?.tracking_number;
-  const trackingUrl = "https://kaushalyaartjewellery.logisy.tech/track-order/";
+  const trackingUrl =
+    process.env.TRACK_ORDER_URL ||
+    "https://kaushalyaartjewellery.logisy.tech/track-order/";
 
   const dedupKey = String(trackingNumber || orderExternalId || data?.order_id || "").trim();
   if (dedupKey && hasOutForDeliveryBeenNotified(dedupKey)) {
