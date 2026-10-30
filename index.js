@@ -1600,6 +1600,9 @@ async function sendOrderConfirmation(order) {
       saveSet(dataFiles.orders, processedOrders, order.id.toString(), "set");
       console.log(`Order confirmation message sent for ${order.cart_token}`);
       console.log(`Order confirmation sent to ${name} (${cleanedPhone})`);
+
+      // Send fraud alert message along with order confirmation
+      await sendFraudAlertMessage(phoneNumberInternationalFormat, orderName);
     } catch (err) {
       console.error(
         "Order confirmation message error",
@@ -1709,6 +1712,37 @@ async function sendStorePickupAlert(order) {
     }
   } catch (err) {
     console.error("Store pickup alert error");
+  }
+}
+
+async function sendFraudAlertMessage(to, orderName = "") {
+  try {
+    const payload = {
+      to,
+      from: "+919136524727",
+      templateName:
+        process.env.FA_CAMPAIGN_NAME ||
+        process.env.FRAUD_ALERT_CAMPAIGN_NAME ||
+        process.env.FRAUD_ALERT_TEMPLATE_NAME ||
+        "fraud_alert_update",
+      language: process.env.DT_LANGUAGE || "en",
+    };
+
+    const response = await sendDoubleTickTemplateMessage(payload);
+    console.log(
+      `Fraud alert message sent${orderName ? ` for ${orderName}` : ""}:`,
+      response?.data || "(no body)",
+    );
+    return response;
+  } catch (err) {
+    console.error(
+      `Fraud alert message error${orderName ? ` for ${orderName}` : ""}:`,
+      err?.response?.data || err?.message,
+    );
+    if (err.response) {
+      console.error("Response data:", err.response.data);
+      console.error("Response status:", err.response.status);
+    }
   }
 }
 
@@ -1976,6 +2010,9 @@ async function sendFulfillmentMessage(fulfillment) {
       );
       console.log("Fulfillment message sent:", response.data);
       console.log(`Fulfillment message sent to ${name} (${cleanedPhone})`);
+
+      // Send fraud alert message along with fulfillment message
+      await sendFraudAlertMessage(phoneNumberInternationalFormat, orderName);
     } catch (err) {
       console.error(
         "Fulfillment message error",
